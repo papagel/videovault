@@ -67,14 +67,33 @@ export function Sidebar() {
     addCollection(collection)
   }
 
-  const toggleTag = (tagName: string) => {
-    const next = activeTags.includes(tagName)
-      ? activeTags.filter((t) => t !== tagName)
-      : [...activeTags, tagName]
-    setActiveTags(next)
+  const toggleTag = (tagName: string, shiftKey: boolean) => {
+    if (shiftKey) {
+      // Shift+click: add/remove from multi-selection
+      const next = activeTags.includes(tagName)
+        ? activeTags.filter((t) => t !== tagName)
+        : [...activeTags, tagName]
+      setActiveTags(next)
+    } else {
+      // Normal click: select only this tag (or deselect if it was the only one)
+      const isOnlyActive = activeTags.length === 1 && activeTags[0] === tagName
+      setActiveTags(isOnlyActive ? [] : [tagName])
+    }
   }
 
   const uniqueFolders = [...new Set(videos.map((v) => v.folder))]
+
+  // Count videos per tag from the in-memory library
+  const tagCounts = videos.reduce<Record<string, number>>((acc, video) => {
+    video.tags.forEach((t) => { acc[t.id] = (acc[t.id] ?? 0) + 1 })
+    return acc
+  }, {})
+
+  // Count videos per folder
+  const folderCounts = videos.reduce<Record<string, number>>((acc, video) => {
+    acc[video.folder] = (acc[video.folder] ?? 0) + 1
+    return acc
+  }, {})
 
   if (!sidebarOpen) return null
 
@@ -126,13 +145,14 @@ export function Sidebar() {
               key={folder}
               onClick={() => setActiveFolder(folder)}
               className={cn(
-                'w-full flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-[#1e1e2a] transition-all truncate',
+                'w-full flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-[#1e1e2a] transition-all',
                 activeFolder === folder ? 'text-[#6366f1]' : 'text-[#8888aa]'
               )}
               title={folder}
             >
               <FolderOpen size={12} className="flex-shrink-0" />
-              <span className="truncate">{folder.split('/').pop()}</span>
+              <span className="truncate flex-1 text-left">{folder.split('/').pop()}</span>
+              <span className="text-[#55556a] flex-shrink-0">{folderCounts[folder] ?? 0}</span>
             </button>
           ))}
         </SidebarSection>
@@ -147,7 +167,7 @@ export function Sidebar() {
           {tags.map((tag) => (
             <button
               key={tag.id}
-              onClick={() => toggleTag(tag.name)}
+              onClick={(e) => toggleTag(tag.name, e.shiftKey)}
               className={cn(
                 'w-full flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-[#1e1e2a] transition-all',
                 activeTags.includes(tag.name) ? 'text-white' : 'text-[#8888aa]'
@@ -157,7 +177,12 @@ export function Sidebar() {
                 className="w-2.5 h-2.5 rounded-full flex-shrink-0"
                 style={{ backgroundColor: tag.color }}
               />
-              <span className="truncate">{tag.name}</span>
+              <span className="truncate flex-1 text-left">{tag.name}</span>
+              {(tagCounts[tag.id] ?? 0) > 0 && (
+                <span className="text-[#55556a] flex-shrink-0 tabular-nums">
+                  {tagCounts[tag.id]}
+                </span>
+              )}
             </button>
           ))}
           {tags.length === 0 && (

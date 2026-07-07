@@ -30,10 +30,22 @@ export function Player() {
     playRandom,
     setShuffleEnabled,
     updateVideo,
+    clearSelection,
+    toggleVideoSelection,
+    setScrollToVideoId,
   } = useStore()
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const [showPlayer, setShowPlayer] = useState(false)
+
+  const closePlayer = useCallback(() => {
+    setShowPlayer(false)
+    if (currentVideo) {
+      clearSelection()
+      toggleVideoSelection(currentVideo.id)
+      setScrollToVideoId(currentVideo.id)
+    }
+  }, [currentVideo, clearSelection, toggleVideoSelection, setScrollToVideoId])
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [controlsVisible, setControlsVisible] = useState(true)
   const hideControlsTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -168,7 +180,7 @@ export function Player() {
           toggleFullscreen()
           break
         case 'Escape':
-          if (!isFullscreen) setShowPlayer(false)
+          if (!isFullscreen) closePlayer()
           break
         case 's':
         case 'S':
@@ -372,12 +384,12 @@ export function Player() {
           </div>
 
           {/* Close button */}
-          <button onClick={() => setShowPlayer(false)}
+          <button onClick={closePlayer}
             className={cn(
               'absolute top-4 right-4 w-8 h-8 rounded-full bg-black/50 border border-white/10 flex items-center justify-center text-white/70 hover:text-white hover:bg-black/70 transition-all',
               isFullscreen && !controlsVisible ? 'opacity-0 pointer-events-none' : 'opacity-100'
             )}
-            title="Minimize (Esc)">
+            title="Back to library (Esc)">
             <ChevronDown size={16} />
           </button>
 

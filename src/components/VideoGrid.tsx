@@ -1,4 +1,4 @@
-import { useMemo, useCallback, useState } from 'react'
+import { useMemo, useCallback, useState, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { useStore } from '@/store'
 import { VideoCard } from './VideoCard'
@@ -18,6 +18,10 @@ export function VideoGrid() {
     sortDir,
     isScanning,
     scanProgress,
+    scrollToVideoId,
+    setScrollToVideoId,
+    pendingDeleteIds,
+    setPendingDeleteIds,
     setContextMenuVideo,
     setShowTrimModal,
     setShowTagModal,
@@ -25,9 +29,29 @@ export function VideoGrid() {
     selectedVideoIds,
     toggleVideoSelection,
     clearSelection,
+    removeVideos,
   } = useStore()
 
+
   const [collectionVideos, setCollectionVideos] = useState<VideoFile[]>([])
+
+  // Scroll to and highlight the video when returning from the player
+  useEffect(() => {
+    if (!scrollToVideoId) return
+    const el = document.querySelector(`[data-video-id="${scrollToVideoId}"]`) as HTMLElement | null
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      // Brief highlight flash
+      el.style.outline = '2px solid #6366f1'
+      el.style.outlineOffset = '2px'
+      const t = setTimeout(() => {
+        el.style.outline = ''
+        el.style.outlineOffset = ''
+      }, 1500)
+      return () => clearTimeout(t)
+    }
+    setScrollToVideoId(null)
+  }, [scrollToVideoId, setScrollToVideoId])
 
   // Load collection videos when active collection changes
   useMemo(() => {
@@ -42,6 +66,11 @@ export function VideoGrid() {
 
   const filteredVideos = useMemo(() => {
     let source = activeCollection ? collectionVideos : videos
+
+    // Hide videos that are pending deletion (undo window open)
+    if (pendingDeleteIds.size > 0) {
+      source = source.filter((v) => !pendingDeleteIds.has(v.id))
+    }
 
     if (activeFolder) {
       source = source.filter((v) => v.folder === activeFolder)
@@ -131,7 +160,7 @@ export function VideoGrid() {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto p-4" onClick={() => clearSelection()}>
+    <div className="flex-1 overflow-y-auto p-4 relative" onClick={() => clearSelection()}>
       {isScanning && scanProgress && (
         <div className="mb-4 bg-[#16161f] border border-[#2a2a3a] rounded-lg p-3 flex items-center gap-3">
           <div className="w-4 h-4 border-2 border-[#6366f1] border-t-transparent rounded-full animate-spin flex-shrink-0" />
@@ -157,25 +186,30 @@ export function VideoGrid() {
       {view === 'grid' ? (
         <div className={`grid gap-3 ${gridCols[gridSize]}`} onClick={(e) => e.stopPropagation()}>
           {filteredVideos.map((video) => (
-            <VideoCard
-              key={video.id}
-              video={video}
-              size={gridSize}
-              onContextMenu={handleContextMenu}
-            />
+            <div key={video.id} data-video-id={video.id} className="transition-all duration-300">
+              <VideoCard
+                video={video}
+                size={gridSize}
+                queue={filteredVideos}
+                onContextMenu={handleContextMenu}
+              />
+            </div>
           ))}
         </div>
       ) : (
         <div className="space-y-px" onClick={(e) => e.stopPropagation()}>
           {filteredVideos.map((video) => (
-            <VideoListRow
-              key={video.id}
-              video={video}
-              onContextMenu={handleContextMenu}
-            />
+            <div key={video.id} data-video-id={video.id} className="transition-all duration-300">
+              <VideoListRow
+                video={video}
+                queue={filteredVideos}
+                onContextMenu={handleContextMenu}
+              />
+            </div>
           ))}
         </div>
       )}
+
     </div>
   )
 }

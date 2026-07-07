@@ -36,6 +36,9 @@ interface UIState {
   contextMenuVideo: VideoFile | null
   quickPreviewVideo: VideoFile | null
   hoveredVideoId: string | null
+  scrollToVideoId: string | null
+  pendingDeleteIds: Set<string>
+  pendingDelete: { ids: string[]; label: string } | null
 }
 
 interface DataState {
@@ -84,6 +87,10 @@ interface AppStore extends PlayerState, UIState, DataState {
   setContextMenuVideo: (v: VideoFile | null) => void
   setQuickPreviewVideo: (v: VideoFile | null) => void
   setHoveredVideoId: (id: string | null) => void
+  setScrollToVideoId: (id: string | null) => void
+  setPendingDeleteIds: (ids: Set<string>) => void
+  setPendingDelete: (v: { ids: string[]; label: string } | null) => void
+  triggerDelete: (ids: string[]) => void
 
   // Data actions
   setVideos: (videos: VideoFile[]) => void
@@ -147,6 +154,9 @@ export const useStore = create<AppStore>()(
       contextMenuVideo: null,
       quickPreviewVideo: null,
       hoveredVideoId: null,
+      scrollToVideoId: null,
+      pendingDeleteIds: new Set<string>(),
+      pendingDelete: null,
 
       // Data state
       videos: [],
@@ -252,6 +262,18 @@ export const useStore = create<AppStore>()(
       setContextMenuVideo: (v) => set({ contextMenuVideo: v }),
       setQuickPreviewVideo: (v) => set({ quickPreviewVideo: v }),
       setHoveredVideoId: (id) => set({ hoveredVideoId: id }),
+      setScrollToVideoId: (id) => set({ scrollToVideoId: id }),
+      setPendingDeleteIds: (ids) => set({ pendingDeleteIds: ids }),
+      setPendingDelete: (v) => set({ pendingDelete: v }),
+      triggerDelete: (ids) => {
+        if (ids.length === 0) return
+        const label = ids.length === 1 ? '1 video' : `${ids.length} videos`
+        set({
+          pendingDeleteIds: new Set(ids),
+          pendingDelete: { ids, label },
+          selectedVideoIds: new Set(),
+        })
+      },
 
       // Data actions
       setVideos: (videos) => set({ videos }),

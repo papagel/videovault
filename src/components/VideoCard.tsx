@@ -2,17 +2,20 @@ import { useState } from 'react'
 import { Play, Check, HardDrive } from 'lucide-react'
 import { useStore } from '@/store'
 import { cn, formatDuration, formatFileSize, getThumbnailSrc, formatResolution } from '@/lib/utils'
+import { useInlineRename } from '@/hooks/useInlineRename'
 import type { VideoFile } from '@/types'
 
 interface VideoCardProps {
   video: VideoFile
   size: 'sm' | 'md' | 'lg'
+  queue: VideoFile[]
   onContextMenu?: (e: React.MouseEvent, video: VideoFile) => void
 }
 
-export function VideoCard({ video, size, onContextMenu }: VideoCardProps) {
-  const { selectedVideoIds, toggleVideoSelection, playVideo, videos, setHoveredVideoId } = useStore()
+export function VideoCard({ video, size, queue, onContextMenu }: VideoCardProps) {
+  const { selectedVideoIds, toggleVideoSelection, playVideo, setHoveredVideoId } = useStore()
   const [hovered, setHovered] = useState(false)
+  const rename = useInlineRename(video)
   const isSelected = selectedVideoIds.has(video.id)
 
   const thumbnailSrc = getThumbnailSrc(video.thumbnail_path)
@@ -46,7 +49,7 @@ export function VideoCard({ video, size, onContextMenu }: VideoCardProps) {
         if (e.metaKey || e.shiftKey || e.ctrlKey) {
           toggleVideoSelection(video.id)
         } else {
-          playVideo(video, videos)
+          playVideo(video, queue)
         }
       }}
     >
@@ -108,9 +111,26 @@ export function VideoCard({ video, size, onContextMenu }: VideoCardProps) {
 
       {/* Info */}
       <div className="p-2 flex-1 flex flex-col gap-1">
-        <p className="text-xs text-[#e8e8f0] font-medium leading-tight line-clamp-2" title={video.filename}>
-          {video.filename.replace(/\.[^/.]+$/, '')}
-        </p>
+        {rename.isEditing ? (
+          <input
+            ref={rename.inputRef}
+            value={rename.editName}
+            onChange={(e) => rename.setEditName(e.target.value)}
+            onKeyDown={rename.handleKeyDown}
+            onBlur={rename.commit}
+            onClick={(e) => e.stopPropagation()}
+            autoFocus
+            className="w-full text-xs bg-[#2a2a3a] text-[#e8e8f0] rounded px-1 py-0.5 outline-none border border-[#6366f1]"
+          />
+        ) : (
+          <p
+            className="text-xs text-[#e8e8f0] font-medium leading-tight line-clamp-2 cursor-text"
+            title="Click to rename"
+            onClick={rename.startEdit}
+          >
+            {video.filename.replace(/\.[^/.]+$/, '')}
+          </p>
+        )}
 
         {size !== 'sm' && (
           <div className="flex items-center gap-2 text-[10px] text-[#55556a]">

@@ -13,6 +13,7 @@ import { SettingsModal } from '@/components/SettingsModal'
 import { RenameModal } from '@/components/RenameModal'
 import { ContextMenu } from '@/components/ContextMenu'
 import { QuickPreview } from '@/components/QuickPreview'
+import { UndoToast } from '@/components/UndoToast'
 import type { Tag, Collection, ScanProgress } from '@/types'
 
 const AppWrapper = () => {
@@ -29,50 +30,52 @@ const AppWrapper = () => {
     setStats,
     setScanning,
     addVideos,
-    watchedFolders,
+    pendingDelete,
+    setPendingDelete,
+    setPendingDeleteIds,
+    removeVideos,
   } = useStore()
 
   const [menuPos, setMenuPos] = useState({ x: 0, y: 0 })
 
-  // Bootstrap: load initial data — defer slightly so Tauri IPC is ready after HMR reloads
+  // Bootstrap + auto-scan: load metadata from SQLite, then immediately scan
+  // all watched folders. Done in one sequential flow so the folder list is
+  // always available before the scan starts (fixes rebuild re-selection bug).
   useEffect(() => {
-    const load = () => {
-      Promise.all([
-        invoke<Tag[]>('get_all_tags'),
-        invoke<Collection[]>('get_collections'),
-        invoke<string[]>('get_watched_folders'),
-      ]).then(([tags, collections, folders]) => {
+    const bootstrap = async () => {
+      try {
+        const [tags, collections, folders] = await Promise.all([
+          invoke<Tag[]>('get_all_tags'),
+          invoke<Collection[]>('get_collections'),
+          invoke<string[]>('get_watched_folders'),
+        ])
         setTags(tags)
         setCollections(collections)
         setWatchedFolders(folders)
-      }).catch((e) => {
-        // Retry once after 500ms if Tauri IPC wasn't ready yet
-        console.warn('Bootstrap failed, retrying...', e)
-        setTimeout(load, 500)
-      })
-    }
-    // Small defer ensures __TAURI__ is injected before first invoke
-    const t = setTimeout(load, 50)
-    return () => clearTimeout(t)
-  }, [])
 
-  // Re-scan watched folders on startup
-  useEffect(() => {
-    if (watchedFolders.length === 0) return
-    const scanAll = async () => {
-      setScanning(true, { total: 0, processed: 0, current_file: 'Scanning...' })
-      for (const folder of watchedFolders) {
-        try {
-          const scanned = await invoke<any[]>('scan_folder', { folderPath: folder })
-          addVideos(scanned)
-        } catch (e) {
-          console.error('Scan error:', e)
+        if (folders.length === 0) return
+
+        setScanning(true, { total: 0, processed: 0, current_file: 'Scanning...' })
+        for (const folder of folders) {
+          try {
+            const scanned = await invoke<any[]>('scan_folder', { folderPath: folder })
+            addVideos(scanned)
+          } catch (e) {
+            console.error('Scan error for folder:', folder, e)
+          }
         }
+        setScanning(false)
+        invoke('get_video_stats').then((stats: any) => setStats(stats)).catch(console.error)
+      } catch (e) {
+        // Tauri IPC not ready yet (HMR reload) — retry after 500ms
+        console.warn('Bootstrap failed, retrying...', e)
+        setTimeout(bootstrap, 500)
       }
-      setScanning(false)
-      invoke('get_video_stats').then((stats: any) => setStats(stats)).catch(console.error)
     }
-    scanAll()
+
+    // 50ms defer ensures __TAURI__ bridge is injected before first invoke
+    const t = setTimeout(bootstrap, 50)
+    return () => clearTimeout(t)
   }, [])
 
   // Scan progress events — defer so Tauri IPC is ready after HMR reloads
@@ -153,6 +156,26 @@ const AppWrapper = () => {
           video={quickPreviewVideo}
           onClose={() => setQuickPreviewVideo(null)}
         />
+      )}
+
+      {/* Undo delete toast */}
+      {pendingDelete && (
+        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-50">
+          <UndoToast
+            pending={pendingDelete}
+            onDone={(undone) => {
+              if (undone) {
+                // Restore: just un-hide the videos
+                setPendingDeleteIds(new Set())
+              } else {
+                // Committed: remove from store permanently
+                removeVideos(pendingDelete.ids)
+                setPendingDeleteIds(new Set())
+              }
+              setPendingDelete(null)
+            }}
+          />
+        </div>
       )}
     </div>
   )

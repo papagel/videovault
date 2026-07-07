@@ -19,7 +19,7 @@ export function ContextMenu({ video, x, y, onClose }: ContextMenuProps) {
   const {
     playVideo, videos, selectedVideoIds, toggleVideoSelection,
     setShowMergeModal, setShowTrimModal, setShowTagModal, setShowRenameModal,
-    setContextMenuVideo, removeVideos, collections, addCollection,
+    setContextMenuVideo, collections, addCollection, triggerDelete,
   } = useStore()
 
   const isSelected = selectedVideoIds.has(video.id)
@@ -57,13 +57,11 @@ export function ContextMenu({ video, x, y, onClose }: ContextMenuProps) {
     onClose()
   }
 
-  const handleDelete = async () => {
+  const handleDelete = () => {
     const targets = isSelected && selectedCount > 1
       ? [...selectedVideoIds]
       : [video.id]
-    if (!confirm(`Move ${targets.length} video(s) to trash?`)) return
-    await invoke('delete_videos', { videoIds: targets, moveToTrash: true })
-    removeVideos(targets)
+    triggerDelete(targets)
     onClose()
   }
 

@@ -42,6 +42,7 @@ pub struct VideoMetadata {
     pub fps: f64,
     pub codec: String,
     pub size_bytes: u64,
+    pub has_audio: bool,
 }
 
 pub fn probe_video(path: &str) -> Result<VideoMetadata> {
@@ -66,6 +67,7 @@ pub fn probe_video(path: &str) -> Result<VideoMetadata> {
         .iter()
         .find(|s| s["codec_type"] == "video")
         .ok_or_else(|| anyhow!("No video stream"))?;
+    let has_audio = streams.iter().any(|s| s["codec_type"] == "audio");
 
     let duration = json["format"]["duration"]
         .as_str()
@@ -94,6 +96,7 @@ pub fn probe_video(path: &str) -> Result<VideoMetadata> {
         fps,
         codec,
         size_bytes,
+        has_audio,
     })
 }
 
@@ -143,33 +146,84 @@ pub fn merge_videos(
         return Err(anyhow!("No input files"));
     }
 
-    // Create a concat list file
-    let list_path = format!("{}.concat_list.txt", output_path);
-    let list_content: String = input_paths
-        .iter()
-        .map(|p| format!("file '{}'\n", p.replace('\'', "'\\''")))
-        .collect();
-    std::fs::write(&list_path, list_content)?;
+    let n = input_paths.len();
 
-    // Get total duration for progress
-    let total_duration: f64 = input_paths
+    // Probe each input to know whether it has an audio stream
+    let metadata: Vec<VideoMetadata> = input_paths
         .iter()
-        .filter_map(|p| probe_video(p).ok())
-        .map(|m| m.duration_secs)
-        .sum();
+        .map(|p| probe_video(p).unwrap_or(VideoMetadata {
+            duration_secs: 0.0, width: 0, height: 0, fps: 0.0,
+            codec: String::new(), size_bytes: 0, has_audio: false,
+        }))
+        .collect();
+
+    let total_duration: f64 = metadata.iter().map(|m| m.duration_secs).sum();
+
+    // Build -i args
+    let mut args: Vec<String> = vec!["-y".into()];
+    for path in input_paths {
+        args.push("-i".into());
+        args.push(path.clone());
+    }
+
+    // Build filter_complex dynamically.
+    // For inputs without audio, generate a silent audio stream (anullsrc)
+    // so every concat slot has both [v] and [a].
+    let mut filter_parts: Vec<String> = Vec::new();
+    let mut concat_slots = String::new();
+
+    for (i, meta) in metadata.iter().enumerate() {
+        let v_label = format!("[v{i}]");
+        let a_label = format!("[a{i}]");
+
+        // Normalize video: scale to 1280x720 with padding to keep aspect ratio,
+        // set constant frame rate — ensures all inputs are compatible.
+        filter_parts.push(format!(
+            "[{i}:v]scale=1280:720:force_original_aspect_ratio=decrease,\
+             pad=1280:720:(ow-iw)/2:(oh-ih)/2,\
+             fps=30,setsar=1{v_label}"
+        ));
+
+        if meta.has_audio {
+            // Normalize audio: stereo, 44100 Hz
+            filter_parts.push(format!(
+                "[{i}:a]aformat=sample_rates=44100:channel_layouts=stereo{a_label}"
+            ));
+        } else {
+            // Synthesise silence matching the video duration
+            let dur = meta.duration_secs;
+            filter_parts.push(format!(
+                "anullsrc=r=44100:cl=stereo:d={dur}{a_label}"
+            ));
+        }
+
+        concat_slots.push_str(&format!("{v_label}{a_label}"));
+    }
+
+    let filter = format!(
+        "{};{}concat=n={n}:v=1:a=1[outv][outa]",
+        filter_parts.join(";"),
+        concat_slots
+    );
+
+    args.extend([
+        "-filter_complex".into(), filter,
+        "-map".into(), "[outv]".into(),
+        "-map".into(), "[outa]".into(),
+        "-c:v".into(), "libx264".into(),
+        "-crf".into(), "23".into(),
+        "-preset".into(), "fast".into(),
+        "-c:a".into(), "aac".into(),
+        "-b:a".into(), "192k".into(),
+        "-movflags".into(), "+faststart".into(),
+        "-progress".into(), "pipe:1".into(),
+        output_path.into(),
+    ]);
 
     let mut child = std::process::Command::new(ffmpeg_bin())
-        .args([
-            "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", &list_path,
-            "-c", "copy",
-            "-progress", "pipe:1",
-            output_path,
-        ])
+        .args(&args)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
 
     if let Some(stdout) = child.stdout.take() {
@@ -189,8 +243,20 @@ pub fn merge_videos(
         }
     }
 
-    child.wait()?;
-    let _ = std::fs::remove_file(&list_path);
+    let status = child.wait()?;
+    if !status.success() {
+        let mut stderr_text = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            use std::io::Read;
+            let _ = err.read_to_string(&mut stderr_text);
+        }
+        return Err(anyhow!(
+            "FFmpeg merge failed (exit {}): {}",
+            status.code().unwrap_or(-1),
+            stderr_text.lines().rev().take(5).collect::<Vec<_>>().join(" | ")
+        ));
+    }
+
     Ok(())
 }
 

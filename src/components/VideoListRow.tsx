@@ -1,15 +1,18 @@
 import { Play, Check } from 'lucide-react'
 import { useStore } from '@/store'
 import { cn, formatDuration, formatFileSize, getThumbnailSrc, formatResolution } from '@/lib/utils'
+import { useInlineRename } from '@/hooks/useInlineRename'
 import type { VideoFile } from '@/types'
 
 interface VideoListRowProps {
   video: VideoFile
+  queue: VideoFile[]
   onContextMenu?: (e: React.MouseEvent, video: VideoFile) => void
 }
 
-export function VideoListRow({ video, onContextMenu }: VideoListRowProps) {
-  const { selectedVideoIds, toggleVideoSelection, playVideo, videos, setHoveredVideoId } = useStore()
+export function VideoListRow({ video, queue, onContextMenu }: VideoListRowProps) {
+  const { selectedVideoIds, toggleVideoSelection, playVideo, setHoveredVideoId } = useStore()
+  const rename = useInlineRename(video)
   const isSelected = selectedVideoIds.has(video.id)
   const thumbnailSrc = getThumbnailSrc(video.thumbnail_path)
 
@@ -27,7 +30,7 @@ export function VideoListRow({ video, onContextMenu }: VideoListRowProps) {
         if (e.metaKey || e.shiftKey || e.ctrlKey) {
           toggleVideoSelection(video.id)
         } else {
-          playVideo(video, videos)
+          playVideo(video, queue)
         }
       }}
       onContextMenu={(e) => onContextMenu?.(e, video)}
@@ -58,7 +61,26 @@ export function VideoListRow({ video, onContextMenu }: VideoListRowProps) {
 
       {/* Name */}
       <div className="flex-1 min-w-0">
-        <p className="text-sm text-[#e8e8f0] truncate">{video.filename}</p>
+        {rename.isEditing ? (
+          <input
+            ref={rename.inputRef}
+            value={rename.editName}
+            onChange={(e) => rename.setEditName(e.target.value)}
+            onKeyDown={rename.handleKeyDown}
+            onBlur={rename.commit}
+            onClick={(e) => e.stopPropagation()}
+            autoFocus
+            className="w-full text-sm bg-[#2a2a3a] text-[#e8e8f0] rounded px-1.5 py-0.5 outline-none border border-[#6366f1]"
+          />
+        ) : (
+          <p
+            className="text-sm text-[#e8e8f0] truncate cursor-text"
+            title="Click to rename"
+            onClick={rename.startEdit}
+          >
+            {video.filename.replace(/\.[^/.]+$/, '')}
+          </p>
+        )}
         {video.tags.length > 0 && (
           <div className="flex gap-1 mt-0.5">
             {video.tags.slice(0, 4).map((tag) => (

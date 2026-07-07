@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+// invoke used for folder scanning below
 import { open } from '@tauri-apps/plugin-dialog'
 import {
   Search, Grid3X3, List, LayoutGrid, FolderPlus, Merge,
@@ -18,7 +19,6 @@ export function Toolbar() {
     setShowMergeModal, setShowTrimModal, setShowTagModal,
     setShowRenameModal,
     addVideos, setWatchedFolders, setScanning,
-    removeVideos,
   } = useStore()
 
   const selectedCount = selectedVideoIds.size
@@ -36,13 +36,12 @@ export function Toolbar() {
     setScanning(false)
   }
 
-  const handleDeleteSelected = async () => {
+  const { triggerDelete } = useStore()
+
+  const handleDeleteSelected = () => {
     const ids = [...selectedVideoIds]
     if (!ids.length) return
-    const confirmed = confirm(`Move ${ids.length} video(s) to trash?`)
-    if (!confirmed) return
-    await invoke('delete_videos', { videoIds: ids, moveToTrash: true })
-    removeVideos(ids)
+    triggerDelete(ids)
   }
 
   const sortOptions: { field: SortField; label: string }[] = [
