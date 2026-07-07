@@ -1,0 +1,46 @@
+---
+description: Rust backend patterns for VideoVault (Tauri commands, FFmpeg, SQLite)
+globs: src-tauri/**/*.rs
+alwaysApply: false
+---
+
+# Rust Backend Conventions
+
+## Tauri Commands
+- All commands live in `commands.rs` and must be registered in `lib.rs` via `tauri::generate_handler![]`
+- Use `State<'_, DbState>` for DB access — `DbState` wraps `Mutex<Connection>`
+- Always `drop(conn)` before any async/blocking operation to avoid holding the lock
+
+```rust
+// ✅ Correct pattern
+let path: String = {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.query_row("SELECT path FROM videos WHERE id = ?1", params![id], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+}; // conn dropped here — safe to do blocking work below
+
+tokio::task::block_in_place(|| {
+    ffmpeg::some_blocking_op(&path)
+        .map_err(|e| e.to_string())
+})
+```
+
+## FFmpeg
+- Always use `ffmpeg_bin()` / `ffprobe_bin()` — never `Command::new("ffmpeg")` directly
+- These helpers check `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin` before falling back to PATH
+- Wrap sync FFmpeg calls in `block_in_place` inside async commands
+
+## SQLite
+- Schema is created in `db.rs::create_tables()` — add migrations there
+- Use `INSERT OR IGNORE` for junction tables (`video_tags`, `collection_videos`)
+- WAL mode is enabled at startup for better concurrent read performance
+
+## Events (progress reporting)
+```rust
+// Emit from Tauri commands
+use tauri::Emitter;
+let _ = app.emit("my-event", payload); // returns Result, ignore with let _
+```
+
+## Error handling
+Commands return `Result<T, String>` — always `.map_err(|e| e.to_string())` on internal errors.

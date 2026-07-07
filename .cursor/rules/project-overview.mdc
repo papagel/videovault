@@ -1,0 +1,63 @@
+---
+description: VideoVault project architecture, stack, and key conventions
+alwaysApply: true
+---
+
+# VideoVault — Project Overview
+
+## What It Is
+A native macOS (cross-platform) desktop video manager built with **Tauri v2 + React + TypeScript + Vite**.
+No web server — ships as a `.app` / `.dmg` installer. Launched with `cargo tauri dev`.
+
+## Tech Stack
+| Layer | Technology |
+|---|---|
+| UI | React 19 + TypeScript + Tailwind CSS v4 |
+| State | Zustand (with `persist` middleware) |
+| Desktop shell | Tauri v2 (Rust backend, WKWebView frontend) |
+| Database | SQLite via `rusqlite` (bundled) |
+| Video processing | FFmpeg (resolved via `ffmpeg_bin()` helper — always use this, never `Command::new("ffmpeg")` directly) |
+| AI tagging | OpenAI / Anthropic / Google Gemini / Ollama (selectable in Settings) |
+
+## Key Directories
+```
+src/                  React frontend
+  components/         UI components (Player, VideoGrid, TagModal, MergeModal, etc.)
+  store/index.ts      Single Zustand store — all global state
+  types/index.ts      Shared TypeScript types
+  lib/utils.ts        Helpers: cn(), formatDuration(), getThumbnailSrc(), getVideoSrc()
+src-tauri/src/
+  lib.rs              App entry — registers all Tauri commands
+  commands.rs         All #[tauri::command] handlers
+  db.rs               SQLite schema + helpers
+  ffmpeg.rs           FFmpeg wrapper (probe, thumbnail, merge, trim)
+  llm.rs              LLM provider abstraction
+  llm_commands.rs     Auto-tag Tauri commands
+```
+
+## Critical Conventions
+
+### File paths → URLs
+Always use `convertFileSrc(path)` or `getThumbnailSrc(path)` (which wraps it) for local file URLs.
+Never use `asset://${path}` directly — it produces the wrong format on macOS.
+
+### Tauri IPC timing (dev only)
+All `invoke()` and `listen()` calls in `useEffect` must be deferred by 50ms to avoid firing before `__TAURI__` is injected after HMR reloads:
+```tsx
+useEffect(() => {
+  const t = setTimeout(() => invoke('...').catch(console.warn), 50)
+  return () => clearTimeout(t)
+}, [])
+```
+
+### FFmpeg path
+In Rust, always call `ffmpeg_bin()` / `ffprobe_bin()` instead of hardcoded strings — resolves Homebrew path on macOS GUI apps where PATH is limited.
+
+### Blocking Rust ops
+Wrap sync FFmpeg calls inside async Tauri commands with `tokio::task::block_in_place(|| { ... })`.
+
+### Asset protocol scope
+`tauri.conf.json` has `assetProtocol.scope: ["$HOME/**"]` — required for WKWebView to load local video/thumbnail files.
+
+## GitHub
+Repo: https://github.com/papagel/videovault

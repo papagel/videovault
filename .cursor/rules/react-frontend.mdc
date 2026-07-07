@@ -1,0 +1,67 @@
+---
+description: React/TypeScript frontend conventions for VideoVault
+globs: src/**/*.{ts,tsx}
+alwaysApply: false
+---
+
+# React Frontend Conventions
+
+## State Management (Zustand)
+All global state lives in `src/store/index.ts`. Add new state slices there.
+```tsx
+// Reading state
+const { currentVideo, setPlaying } = useStore()
+
+// Avoid reading the whole store — select only what you need to prevent re-renders
+```
+
+## Tauri API Usage
+```tsx
+import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+import { convertFileSrc } from '@tauri-apps/api/core'
+import { open, save } from '@tauri-apps/plugin-dialog'
+```
+
+### Local file URLs — always use helpers
+```tsx
+import { getThumbnailSrc, getVideoSrc } from '@/lib/utils'
+
+// ✅ Correct
+<img src={getThumbnailSrc(video.thumbnail_path)} />
+<video src={convertFileSrc(video.path)} />
+
+// ❌ Wrong — breaks on macOS
+<img src={`asset://${path}`} />
+```
+
+### IPC timing guard (dev HMR safety)
+```tsx
+useEffect(() => {
+  const t = setTimeout(() => {
+    invoke<MyType>('command_name', { arg }).then(setData).catch(console.warn)
+  }, 50)
+  return () => clearTimeout(t)
+}, [])
+```
+
+## Component Patterns
+- Modals use `if (!showXxxModal) return null` — they stay mounted in the tree but render nothing
+- Modal state is always reset in a `useEffect` on the open flag:
+```tsx
+useEffect(() => {
+  if (!showModal) return
+  // reset local state here
+  setError(null)
+  setMyList(videos.filter(v => selectedVideoIds.has(v.id)))
+}, [showModal])
+```
+
+## Styling
+- Tailwind CSS v4 — configured via `@tailwindcss/vite` plugin (no `tailwind.config.js`)
+- Dark-only app — base colors defined as CSS vars in `src/index.css`
+- Use `cn()` from `@/lib/utils` for conditional class names (wraps `clsx` + `tailwind-merge`)
+- Avoid mixing Tailwind border/opacity classes with inline `style` — use inline style for dynamic colors
+
+## Path Alias
+`@/` maps to `src/` — always use this instead of relative `../../` imports.
