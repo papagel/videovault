@@ -3,26 +3,32 @@ import { invoke } from '@tauri-apps/api/core'
 import { FileText, X } from 'lucide-react'
 import { useStore } from '@/store'
 
-export function RenameModal() {
+interface RenameModalProps {
+  onClose?: () => void
+}
+
+export function RenameModal({ onClose }: RenameModalProps) {
   const {
     showRenameModal, setShowRenameModal,
     contextMenuVideo, selectedVideoIds, videos, updateVideo,
   } = useStore()
+  const close = () => onClose ? onClose() : close()
 
-  const targetVideo = contextMenuVideo
-    ?? videos.find((v) => selectedVideoIds.has(v.id))
-
+  // Snapshot when the modal opens — contextMenuVideo is cleared by onClose()
+  // before we render, so we can't read it live.
+  const [targetVideo, setTargetVideo] = useState<typeof contextMenuVideo>(null)
   const [name, setName] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
   useEffect(() => {
-    if (targetVideo && showRenameModal) {
-      // Set to filename without extension
-      setName(targetVideo.filename.replace(/\.[^/.]+$/, ''))
+    if (showRenameModal) {
+      const video = contextMenuVideo ?? videos.find((v) => selectedVideoIds.has(v.id)) ?? null
+      setTargetVideo(video)
+      setName(video?.filename.replace(/\.[^/.]+$/, '') ?? '')
       setError('')
     }
-  }, [targetVideo?.id, showRenameModal])
+  }, [showRenameModal])
 
   const handleSave = async () => {
     if (!targetVideo || !name.trim()) return
@@ -36,7 +42,7 @@ export function RenameModal() {
       const ext = targetVideo.filename.split('.').pop() ?? ''
       const newFilename = name.includes('.') ? name : `${name}.${ext}`
       updateVideo(targetVideo.id, { path: newPath, filename: newFilename })
-      setShowRenameModal(false)
+      close()
     } catch (e) {
       setError(String(e))
     } finally {
@@ -54,7 +60,7 @@ export function RenameModal() {
             <FileText size={18} className="text-[#6366f1]" />
             <h2 className="text-base font-semibold text-[#e8e8f0]">Rename</h2>
           </div>
-          <button onClick={() => setShowRenameModal(false)} className="text-[#55556a] hover:text-white">
+          <button onClick={close} className="text-[#55556a] hover:text-white">
             <X size={18} />
           </button>
         </div>
@@ -83,7 +89,7 @@ export function RenameModal() {
 
         <div className="flex items-center justify-end gap-3 p-5 border-t border-[#2a2a3a]">
           <button
-            onClick={() => setShowRenameModal(false)}
+            onClick={close}
             className="px-4 py-2 text-sm text-[#8888aa] hover:text-white transition-all"
           >
             Cancel

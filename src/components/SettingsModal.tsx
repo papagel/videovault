@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { Settings, X, Eye, EyeOff } from 'lucide-react'
+import { Settings, X, Eye, EyeOff, Film, HardDrive, Clock } from 'lucide-react'
 import { useStore } from '@/store'
-import { cn } from '@/lib/utils'
+import { cn, formatDuration, formatFileSize } from '@/lib/utils'
 
 const PROVIDERS = [
   { id: 'open_ai', label: 'OpenAI', cloud: true },
@@ -32,7 +32,7 @@ const MODELS: Record<string, { id: string; label: string }[]> = {
 }
 
 export function SettingsModal() {
-  const { showSettingsModal, setShowSettingsModal, settings, updateSettings } = useStore()
+  const { showSettingsModal, setShowSettingsModal, settings, updateSettings, stats, videos } = useStore()
   const [ffmpegAvailable, setFfmpegAvailable] = useState<boolean | null>(null)
   const [showApiKey, setShowApiKey] = useState(false)
 
@@ -65,6 +65,24 @@ export function SettingsModal() {
         </div>
 
         <div className="p-5 space-y-6 max-h-[70vh] overflow-y-auto">
+          {/* Library Stats */}
+          <section>
+            <h3 className="text-xs font-semibold text-[#8888aa] uppercase tracking-wider mb-3">Library</h3>
+            <div className="grid grid-cols-3 gap-2">
+              {[
+                { icon: <Film size={14} />, label: 'Videos', value: String(stats?.total_videos ?? videos.length) },
+                { icon: <HardDrive size={14} />, label: 'Size', value: formatFileSize(stats?.total_size_bytes ?? 0) },
+                { icon: <Clock size={14} />, label: 'Duration', value: formatDuration(stats?.total_duration_secs ?? 0) },
+              ].map(({ icon, label, value }) => (
+                <div key={label} className="bg-[#111118] border border-[#2a2a3a] rounded-lg p-3 flex flex-col items-center gap-1.5">
+                  <span className="text-[#55556a]">{icon}</span>
+                  <span className="text-sm font-semibold text-[#e8e8f0]">{value}</span>
+                  <span className="text-[10px] text-[#55556a]">{label}</span>
+                </div>
+              ))}
+            </div>
+          </section>
+
           {/* System Status */}
           <section>
             <h3 className="text-xs font-semibold text-[#8888aa] uppercase tracking-wider mb-3">System</h3>

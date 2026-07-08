@@ -72,6 +72,7 @@ interface AppStore extends PlayerState, UIState, DataState {
   toggleVideoSelection: (id: string) => void
   selectAll: () => void
   clearSelection: () => void
+  selectByIds: (ids: string[]) => void
   setActiveFolder: (folder: string | null) => void
   setActiveTags: (tags: string[]) => void
   setActiveCollection: (id: string | null) => void
@@ -243,6 +244,7 @@ export const useStore = create<AppStore>()(
         })),
 
       clearSelection: () => set({ selectedVideoIds: new Set() }),
+      selectByIds: (ids: string[]) => set({ selectedVideoIds: new Set(ids) }),
 
       setActiveFolder: (folder) => set({ activeFolder: folder, activeCollection: null }),
       setActiveTags: (tags) => set({ activeTags: tags }),
@@ -317,3 +319,8 @@ export const useStore = create<AppStore>()(
     }
   )
 )
+
+// Dev-only: expose the store for debugging and automated UI tests
+if (import.meta.env.DEV) {
+  ;(window as any).__store = useStore
+}

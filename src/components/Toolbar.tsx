@@ -2,8 +2,8 @@ import { invoke } from '@tauri-apps/api/core'
 // invoke used for folder scanning below
 import { open } from '@tauri-apps/plugin-dialog'
 import {
-  Search, Grid3X3, List, LayoutGrid, FolderPlus, Merge,
-  Scissors, Tag, Trash2, RefreshCw, SortAsc, SortDesc, ChevronDown,
+  Grid3X3, List, FolderPlus, Merge,
+  Scissors, Tag, Trash2, SortAsc, SortDesc, ChevronDown,
   PanelLeftClose, PanelLeft, Sparkles,
 } from 'lucide-react'
 import { useStore } from '@/store'
@@ -65,18 +65,6 @@ export function Toolbar() {
 
       <div className="w-px h-5 bg-[#2a2a3a] mx-1" />
 
-      {/* Search */}
-      <div className="flex items-center gap-2 bg-[#16161f] border border-[#2a2a3a] rounded-lg px-3 py-1.5 flex-1 max-w-sm">
-        <Search size={13} className="text-[#55556a] flex-shrink-0" />
-        <input
-          type="text"
-          placeholder="Search videos..."
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          className="bg-transparent text-sm text-[#e8e8f0] placeholder-[#55556a] outline-none flex-1 min-w-0"
-        />
-      </div>
-
       {/* Sort */}
       <div className="relative group">
         <button className="flex items-center gap-1.5 text-xs text-[#8888aa] hover:text-white bg-[#16161f] border border-[#2a2a3a] rounded-lg px-2.5 py-1.5 transition-all">
@@ -117,7 +105,13 @@ export function Toolbar() {
       {/* Selection actions */}
       {selectedCount > 0 && (
         <div className="flex items-center gap-1 bg-[#1e1e2a] border border-[#2a2a3a] rounded-lg px-2 py-1">
-          <span className="text-xs text-[#6366f1] font-medium mr-1">{selectedCount} selected</span>
+          <button
+            onClick={() => useStore.getState().clearSelection()}
+            className="text-xs text-[#6366f1] font-medium mr-1 hover:text-[#7c7ff5] transition-all"
+            title="Click to deselect all"
+          >
+            {selectedCount} selected ×
+          </button>
           {selectedCount >= 2 && (
             <ToolbarActionButton onClick={() => setShowMergeModal(true)} title="Merge" icon={<Merge size={13} />} />
           )}

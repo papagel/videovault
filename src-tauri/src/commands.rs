@@ -644,6 +644,46 @@ pub async fn remove_watched_folder(
     Ok(())
 }
 
+/// Remove a watched folder AND all its indexed videos from the library.
+/// Files on disk are NOT touched — only database records are removed.
+#[tauri::command]
+pub async fn remove_folder_from_library(
+    path: String,
+    db: State<'_, DbState>,
+) -> Result<u32, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let prefix = format!("{}/%", path);
+
+    conn.execute(
+        "DELETE FROM video_tags WHERE video_id IN
+         (SELECT id FROM videos WHERE folder = ?1 OR folder LIKE ?2)",
+        params![path, prefix],
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "DELETE FROM collection_videos WHERE video_id IN
+         (SELECT id FROM videos WHERE folder = ?1 OR folder LIKE ?2)",
+        params![path, prefix],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let removed = conn
+        .execute(
+            "DELETE FROM videos WHERE folder = ?1 OR folder LIKE ?2",
+            params![path, prefix],
+        )
+        .map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "DELETE FROM watched_folders WHERE path = ?1",
+        params![path],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(removed as u32)
+}
+
 #[tauri::command]
 pub async fn get_collections(db: State<'_, DbState>) -> Result<Vec<Collection>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -709,6 +749,25 @@ pub async fn add_to_collection(
         )
         .map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_collection(
+    collection_id: String,
+    db: State<'_, DbState>,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM collection_videos WHERE collection_id = ?1",
+        params![collection_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM collections WHERE id = ?1",
+        params![collection_id],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

@@ -7,11 +7,17 @@ import { cn, formatDuration, getVideoSrc } from '@/lib/utils'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import type { TrimSegment } from '@/types'
 
-export function TrimModal() {
-  const { showTrimModal, setShowTrimModal, selectedVideoIds, videos, contextMenuVideo } = useStore()
+interface TrimModalProps {
+  onClose?: () => void
+}
 
-  const targetVideo = contextMenuVideo
-    ?? videos.find((v) => selectedVideoIds.has(v.id))
+export function TrimModal({ onClose }: TrimModalProps) {
+  const { showTrimModal, setShowTrimModal, selectedVideoIds, videos, contextMenuVideo } = useStore()
+  const close = () => onClose ? onClose() : setShowTrimModal(false)
+
+  // Snapshot the target video when the modal opens so it survives the context
+  // menu closing (which clears contextMenuVideo immediately after onClose()).
+  const [targetVideo, setTargetVideo] = useState<typeof contextMenuVideo>(null)
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const [duration, setDuration] = useState(0)
@@ -22,12 +28,14 @@ export function TrimModal() {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    if (targetVideo && showTrimModal) {
+    if (showTrimModal) {
+      const video = contextMenuVideo ?? videos.find((v) => selectedVideoIds.has(v.id)) ?? null
+      setTargetVideo(video)
       setSegments([{ start: 0, end: 0 }])
       setDone(null)
       setError(null)
     }
-  }, [targetVideo?.id, showTrimModal])
+  }, [showTrimModal])
 
   const handleDurationChange = (e: React.ChangeEvent<HTMLVideoElement>) => {
     const d = e.currentTarget.duration
@@ -99,7 +107,7 @@ export function TrimModal() {
             <Scissors size={18} className="text-[#6366f1]" />
             <h2 className="text-base font-semibold text-[#e8e8f0]">Trim Video</h2>
           </div>
-          <button onClick={() => setShowTrimModal(false)} className="text-[#55556a] hover:text-white">
+          <button onClick={close} className="text-[#55556a] hover:text-white">
             <X size={18} />
           </button>
         </div>
@@ -228,7 +236,7 @@ export function TrimModal() {
         {/* Actions */}
         <div className="flex items-center justify-end gap-3 p-5 border-t border-[#2a2a3a] flex-shrink-0">
           <button
-            onClick={() => setShowTrimModal(false)}
+            onClick={close}
             className="px-4 py-2 text-sm text-[#8888aa] hover:text-white transition-all"
           >
             Close

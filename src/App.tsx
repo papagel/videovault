@@ -34,6 +34,10 @@ const AppWrapper = () => {
     setPendingDelete,
     setPendingDeleteIds,
     removeVideos,
+    showTrimModal,
+    setShowTrimModal,
+    showRenameModal,
+    setShowRenameModal,
   } = useStore()
 
   const [menuPos, setMenuPos] = useState({ x: 0, y: 0 })
@@ -110,10 +114,31 @@ const AppWrapper = () => {
         return
       }
 
-      // Escape → close context menu / quick preview
+      // Cmd+A / Ctrl+A → select all visible, second press deselects all
+      if ((e.metaKey || e.ctrlKey) && e.key === 'a' && !isInput) {
+        e.preventDefault()
+        const ids: string[] = []
+        document.querySelectorAll<HTMLElement>('[data-video-id]').forEach((el) => {
+          const id = el.dataset.videoId
+          if (id) ids.push(id)
+        })
+        const { selectedVideoIds, selectByIds, clearSelection } = useStore.getState()
+        const allSelected = ids.length > 0 && ids.every((id) => selectedVideoIds.has(id))
+        if (allSelected) clearSelection()
+        else if (ids.length > 0) selectByIds(ids)
+        return
+      }
+
+      // Escape → close everything (priority: innermost first)
       if (e.key === 'Escape') {
-        setContextMenuVideo(null)
-        setQuickPreviewVideo(null)
+        const s = useStore.getState()
+        if (s.quickPreviewVideo)    { s.setQuickPreviewVideo(null);  return }
+        if (s.contextMenuVideo)     { s.setContextMenuVideo(null);   return }
+        if (s.showTrimModal)        { s.setShowTrimModal(false); s.setContextMenuVideo(null); return }
+        if (s.showRenameModal)      { s.setShowRenameModal(false); s.setContextMenuVideo(null); return }
+        if (s.showTagModal)         { s.setShowTagModal(false);      return }
+        if (s.showMergeModal)       { s.setShowMergeModal(false);    return }
+        if (s.showSettingsModal)    { s.setShowSettingsModal(false); return }
       }
     }
     window.addEventListener('keydown', handler)
@@ -137,12 +162,21 @@ const AppWrapper = () => {
       <Player />
 
       <MergeModal />
-      <TrimModal />
       <TagModal />
       <SettingsModal />
-      <RenameModal />
+      {/* Trim and Rename modals — wrap with clear of contextMenuVideo on close */}
+      <TrimModal onClose={() => {
+        setShowTrimModal(false)
+        setContextMenuVideo(null)
+      }} />
+      <RenameModal onClose={() => {
+        setShowRenameModal(false)
+        setContextMenuVideo(null)
+      }} />
 
-      {contextMenuVideo && (
+      {/* Hide context menu automatically when trim/rename modals are open
+          so contextMenuVideo stays alive for those modals to read */}
+      {contextMenuVideo && !showTrimModal && !showRenameModal && (
         <ContextMenu
           video={contextMenuVideo}
           x={menuPos.x}

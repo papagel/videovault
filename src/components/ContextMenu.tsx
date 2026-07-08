@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import {
-  Play, Scissors, Merge, Tag, Trash2, FolderOpen, Copy,
-  RefreshCw, Sparkles, FileText, X, PlusSquare,
+  Play, Scissors, Merge, Tag, Trash2, FolderOpen,
+  Sparkles, FileText, X, PlusSquare,
 } from 'lucide-react'
+import { showPrompt } from '@/lib/dialog'
 import { useStore } from '@/store'
 import type { VideoFile, Collection } from '@/types'
 
@@ -65,19 +66,25 @@ export function ContextMenu({ video, x, y, onClose }: ContextMenuProps) {
     onClose()
   }
 
+  const refreshCollections = async () => {
+    const updated = await invoke<Collection[]>('get_collections')
+    useStore.getState().setCollections(updated)
+  }
+
   const handleAddToCollection = async (collectionId: string) => {
     const videoIds = isSelected && selectedCount > 1 ? [...selectedVideoIds] : [video.id]
     await invoke('add_to_collection', { collectionId, videoIds })
+    await refreshCollections()
     onClose()
   }
 
   const handleCreateAndAddToCollection = async () => {
-    const name = prompt('New collection name:')
+    const name = await showPrompt('New Collection', 'Collection name…')
     if (!name) return
     const col = await invoke<Collection>('create_collection', { name, description: null })
-    addCollection(col)
     const videoIds = isSelected && selectedCount > 1 ? [...selectedVideoIds] : [video.id]
     await invoke('add_to_collection', { collectionId: col.id, videoIds })
+    await refreshCollections()
     onClose()
   }
 
@@ -106,7 +113,8 @@ export function ContextMenu({ video, x, y, onClose }: ContextMenuProps) {
         onClick={() => {
           setContextMenuVideo(video)
           setShowTrimModal(true)
-          onClose()
+          // don't call onClose() — App.tsx hides the context menu
+          // when showTrimModal is true, keeping contextMenuVideo alive for the modal
         }}
       />
 
@@ -175,7 +183,7 @@ export function ContextMenu({ video, x, y, onClose }: ContextMenuProps) {
         onClick={() => {
           setContextMenuVideo(video)
           setShowRenameModal(true)
-          onClose()
+          // don't call onClose() — same reason as Trim above
         }}
       />
 

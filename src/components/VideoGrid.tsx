@@ -1,4 +1,4 @@
-import { useMemo, useCallback, useState, useEffect } from 'react'
+import { useMemo, useCallback, useState, useEffect, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { useStore } from '@/store'
 import { VideoCard } from './VideoCard'
@@ -35,6 +35,17 @@ export function VideoGrid() {
 
   const [collectionVideos, setCollectionVideos] = useState<VideoFile[]>([])
 
+  // Load collection videos whenever the active collection changes
+  useEffect(() => {
+    if (!activeCollection) {
+      setCollectionVideos([])
+      return
+    }
+    invoke<VideoFile[]>('get_collection_videos', { collectionId: activeCollection })
+      .then(setCollectionVideos)
+      .catch(console.error)
+  }, [activeCollection])
+
   // Scroll to and highlight the video when returning from the player
   useEffect(() => {
     if (!scrollToVideoId) return
@@ -53,16 +64,6 @@ export function VideoGrid() {
     setScrollToVideoId(null)
   }, [scrollToVideoId, setScrollToVideoId])
 
-  // Load collection videos when active collection changes
-  useMemo(() => {
-    if (!activeCollection) {
-      setCollectionVideos([])
-      return
-    }
-    invoke<VideoFile[]>('get_collection_videos', { collectionId: activeCollection })
-      .then(setCollectionVideos)
-      .catch(console.error)
-  }, [activeCollection])
 
   const filteredVideos = useMemo(() => {
     let source = activeCollection ? collectionVideos : videos
@@ -73,7 +74,9 @@ export function VideoGrid() {
     }
 
     if (activeFolder) {
-      source = source.filter((v) => v.folder === activeFolder)
+      source = source.filter(
+        (v) => v.folder === activeFolder || v.folder.startsWith(activeFolder + '/')
+      )
     }
 
     if (activeTags.length > 0) {
@@ -118,6 +121,132 @@ export function VideoGrid() {
     [setContextMenuVideo]
   )
 
+  // ── Rubber-band drag selection ────────────────────────────────────────────
+  // The rectangle is tracked in CONTENT coordinates (the grid's scrollable
+  // space), not viewport coordinates. This keeps the selection anchored to
+  // the videos themselves when the user scrolls mid-drag.
+  const containerRef = useRef<HTMLDivElement>(null)
+  const dragOrigin = useRef<{ x: number; y: number } | null>(null) // content coords
+  const dragRectRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null) // content coords
+  const [dragRect, setDragRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null)
+
+  const handlePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return
+    if ((e.target as HTMLElement).closest('[data-video-id]')) return
+    const container = containerRef.current
+    if (!container) return
+
+    const toContent = (clientX: number, clientY: number) => {
+      const r = container.getBoundingClientRect()
+      return {
+        x: clientX - r.left + container.scrollLeft,
+        y: clientY - r.top + container.scrollTop,
+      }
+    }
+
+    useStore.getState().clearSelection()
+    dragOrigin.current = toContent(e.clientX, e.clientY)
+    dragRectRef.current = null
+
+    let lastClient = { x: e.clientX, y: e.clientY }
+    let rafId = 0
+
+    const updateRect = () => {
+      if (!dragOrigin.current) return
+      const p = toContent(lastClient.x, lastClient.y)
+      const ox = dragOrigin.current.x
+      const oy = dragOrigin.current.y
+      const r = {
+        x: Math.min(p.x, ox),
+        y: Math.min(p.y, oy),
+        w: Math.abs(p.x - ox),
+        h: Math.abs(p.y - oy),
+      }
+      dragRectRef.current = r
+      setDragRect({ ...r })
+    }
+
+    // Auto-scroll when the pointer nears the container's top/bottom edge.
+    // Runs on a rAF loop so scrolling continues while the pointer is held still.
+    const EDGE = 48
+    const MAX_SPEED = 18
+    const autoScrollLoop = () => {
+      if (!dragOrigin.current) return
+      const r = container.getBoundingClientRect()
+      let dy = 0
+      if (lastClient.y < r.top + EDGE) {
+        dy = -Math.min(MAX_SPEED, ((r.top + EDGE - lastClient.y) / EDGE) * MAX_SPEED)
+      } else if (lastClient.y > r.bottom - EDGE) {
+        dy = Math.min(MAX_SPEED, ((lastClient.y - (r.bottom - EDGE)) / EDGE) * MAX_SPEED)
+      }
+      if (dy !== 0) {
+        container.scrollTop += dy
+      }
+      // Refresh every frame: also covers manual wheel/trackpad scrolling mid-drag
+      updateRect()
+      rafId = requestAnimationFrame(autoScrollLoop)
+    }
+    rafId = requestAnimationFrame(autoScrollLoop)
+
+    const onMove = (ev: PointerEvent) => {
+      lastClient = { x: ev.clientX, y: ev.clientY }
+      updateRect()
+    }
+
+    const onUp = () => {
+      document.removeEventListener('pointermove', onMove)
+      document.removeEventListener('pointerup', onUp)
+      document.removeEventListener('pointercancel', onUp)
+      cancelAnimationFrame(rafId)
+
+      const rect = dragRectRef.current
+      const wasDrag = !!(dragOrigin.current && rect && (rect.w > 4 || rect.h > 4))
+
+      if (wasDrag && rect) {
+        // Compare in content coordinates: convert each card's viewport rect
+        // into the container's scroll space.
+        const contRect = container.getBoundingClientRect()
+        const sx = container.scrollLeft
+        const sy = container.scrollTop
+        const ids: string[] = []
+        document.querySelectorAll<HTMLElement>('[data-video-id]').forEach((el) => {
+          const id = el.dataset.videoId
+          if (!id) return
+          const cr = el.getBoundingClientRect()
+          const left = cr.left - contRect.left + sx
+          const top = cr.top - contRect.top + sy
+          if (
+            left < rect.x + rect.w &&
+            left + cr.width > rect.x &&
+            top < rect.y + rect.h &&
+            top + cr.height > rect.y
+          ) ids.push(id)
+        })
+        if (ids.length > 0) useStore.getState().selectByIds(ids)
+
+        // Swallow the trailing click that follows pointerup so it can't
+        // clear the selection or trigger playback.
+        const suppressClick = (ce: MouseEvent) => {
+          ce.stopPropagation()
+          ce.preventDefault()
+        }
+        window.addEventListener('click', suppressClick, { capture: true, once: true })
+        setTimeout(() => {
+          window.removeEventListener('click', suppressClick, { capture: true })
+        }, 250)
+      }
+
+      dragOrigin.current = null
+      dragRectRef.current = null
+      setDragRect(null)
+    }
+
+    document.addEventListener('pointermove', onMove)
+    document.addEventListener('pointerup', onUp)
+    document.addEventListener('pointercancel', onUp)
+  }, [])
+  // ─────────────────────────────────────────────────────────────────────────
+
   const gridCols = {
     sm: 'grid-cols-[repeat(auto-fill,minmax(144px,1fr))]',
     md: 'grid-cols-[repeat(auto-fill,minmax(192px,1fr))]',
@@ -160,7 +289,15 @@ export function VideoGrid() {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto p-4 relative" onClick={() => clearSelection()}>
+    <div
+      ref={containerRef}
+      className="flex-1 overflow-y-auto p-4 relative select-none"
+      onClick={(e) => {
+        if (dragRectRef.current) return
+        if (!(e.target as HTMLElement).closest('[data-video-id]')) clearSelection()
+      }}
+      onPointerDown={handlePointerDown}
+    >
       {isScanning && scanProgress && (
         <div className="mb-4 bg-[#16161f] border border-[#2a2a3a] rounded-lg p-3 flex items-center gap-3">
           <div className="w-4 h-4 border-2 border-[#6366f1] border-t-transparent rounded-full animate-spin flex-shrink-0" />
@@ -210,6 +347,19 @@ export function VideoGrid() {
         </div>
       )}
 
+      {/* Rubber-band selection rectangle (positioned in content space so it
+          stays anchored to the videos while scrolling) */}
+      {dragRect && (
+        <div
+          className="absolute pointer-events-none z-30 border border-[#6366f1] bg-[#6366f1]/10 rounded"
+          style={{
+            left: dragRect.x,
+            top: dragRect.y,
+            width: dragRect.w,
+            height: dragRect.h,
+          }}
+        />
+      )}
     </div>
   )
 }
