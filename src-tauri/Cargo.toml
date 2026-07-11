@@ -31,15 +31,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# HTTP client for LLM APIs
-reqwest = { version = "0.12", features = ["json", "multipart"] }
-
 # Filesystem watching
 notify = "7"
-
-# Image processing for thumbnails
-image = "0.25"
-base64 = "0.22"
 
 # Utilities
 uuid = { version = "1", features = ["v4"] }

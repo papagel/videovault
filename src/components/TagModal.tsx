@@ -1,9 +1,8 @@
 import { useState, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
-import { Tag, X, Plus, Minus, Sparkles, Check, Loader2, AlertCircle } from 'lucide-react'
+import { Tag, X, Plus, Minus, Loader2, AlertCircle } from 'lucide-react'
+import { showConfirm } from '@/lib/dialog'
 import { useStore } from '@/store'
-import { cn } from '@/lib/utils'
 import type { Tag as TagType } from '@/types'
 
 const TAG_COLORS = [
@@ -14,7 +13,7 @@ const TAG_COLORS = [
 export function TagModal() {
   const {
     showTagModal, setShowTagModal,
-    selectedVideoIds, videos, tags, setTags, addTag, updateVideo, settings,
+    selectedVideoIds, videos, tags, setTags, addTag, updateVideo,
   } = useStore()
 
   // Snapshot the selection when the modal opens so it's stable during the session
@@ -25,8 +24,7 @@ export function TagModal() {
   const [selectedColor, setSelectedColor] = useState(TAG_COLORS[0])
   const [pendingTagIds, setPendingTagIds] = useState<Set<string>>(new Set())
   const [appliedTagIds, setAppliedTagIds] = useState<Set<string>>(new Set())
-  const [aiTagging, setAiTagging] = useState(false)
-  const [aiResults, setAiResults] = useState<Record<string, { tags: string[]; description?: string }>>({})
+  const [showCreateForm, setShowCreateForm] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   // Snapshot selection + refresh tags when modal opens
@@ -34,9 +32,10 @@ export function TagModal() {
     if (!showTagModal) return
     const ids = [...selectedVideoIds]
     setTargetVideoIds(ids)
-    setAiResults({})
     setError(null)
     setPendingTagIds(new Set())
+    setShowCreateForm(false)
+    setNewTagName('')
 
     invoke<TagType[]>('get_all_tags')
       .then((t) => {
@@ -63,6 +62,36 @@ export function TagModal() {
       setNewTagName('')
     } catch (e) {
       setError(`Failed to create tag: ${e}`)
+    }
+  }
+
+  const handleDeleteTag = async (tag: TagType) => {
+    const ok = await showConfirm(
+      `Delete tag "${tag.name}"?\nIt will be removed from all videos. This cannot be undone.`
+    )
+    if (!ok) return
+    setError(null)
+    try {
+      await invoke('delete_tag', { tagId: tag.id })
+      const s = useStore.getState()
+      s.setTags(s.tags.filter((t) => t.id !== tag.id))
+      // Strip the tag from every video in the store
+      s.videos.forEach((v) => {
+        if (v.tags.some((t) => t.id === tag.id)) {
+          s.updateVideo(v.id, { tags: v.tags.filter((t) => t.id !== tag.id) })
+        }
+      })
+      // Drop it from any active tag filter
+      if (s.activeTags.includes(tag.name)) {
+        s.setActiveTags(s.activeTags.filter((n) => n !== tag.name))
+      }
+      setAppliedTagIds((prev) => {
+        const next = new Set(prev)
+        next.delete(tag.id)
+        return next
+      })
+    } catch (e) {
+      setError(`Failed to delete tag: ${e}`)
     }
   }
 
@@ -109,44 +138,6 @@ export function TagModal() {
     }
   }
 
-  const handleAutoTag = async () => {
-    if (targetVideoIds.length === 0) {
-      setError('No videos selected')
-      return
-    }
-    setAiTagging(true)
-    setAiResults({})
-    setError(null)
-
-    const unlisten = await listen('tagging-progress', () => {}).catch(() => () => {})
-
-    try {
-      const results = await invoke<Record<string, any>>('auto_tag_videos', {
-        request: {
-          video_ids: targetVideoIds,
-          config: settings.llm,
-        },
-      })
-      setAiResults(results as any)
-
-      // Refresh tags + update each video
-      const updatedTags = await invoke<TagType[]>('get_all_tags')
-      setTags(updatedTags)
-      for (const videoId of Object.keys(results)) {
-        if (results[videoId].error) continue
-        const videoTags = updatedTags.filter((t) =>
-          (results[videoId].tags ?? []).includes(t.name)
-        )
-        updateVideo(videoId, { tags: videoTags })
-      }
-    } catch (e) {
-      setError(`AI tagging failed: ${e}`)
-    } finally {
-      if (typeof unlisten === 'function') unlisten()
-      setAiTagging(false)
-    }
-  }
-
   if (!showTagModal) return null
 
   return (
@@ -170,7 +161,7 @@ export function TagModal() {
           </button>
         </div>
 
-        <div className="p-5 space-y-5">
+        <div className="p-5 space-y-4">
           {/* Error */}
           {error && (
             <div className="flex items-center gap-2 text-xs text-red-400 bg-red-500/10 rounded-lg p-3">
@@ -183,124 +174,96 @@ export function TagModal() {
             <p className="text-xs text-[#55556a] text-center py-2">No videos selected</p>
           )}
 
-          {/* AI Tagging */}
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-xs font-medium text-[#8888aa]">Auto-Tag with AI</span>
-              <span className="text-[10px] text-[#55556a]">{settings.llm.provider} / {settings.llm.model}</span>
-            </div>
-            <button
-              onClick={handleAutoTag}
-              disabled={aiTagging || targetVideos.length === 0}
-              className="w-full flex items-center justify-center gap-2 py-2.5 text-sm bg-[#6366f1]/10 border border-[#6366f1]/30 text-[#6366f1] rounded-lg hover:bg-[#6366f1]/20 transition-all disabled:opacity-50"
-            >
-              {aiTagging
-                ? <><Loader2 size={14} className="animate-spin" /> Analyzing with AI...</>
-                : <><Sparkles size={14} /> Auto-Tag Selected Videos</>}
-            </button>
-
-            {Object.keys(aiResults).length > 0 && (
-              <div className="mt-3 space-y-2 max-h-36 overflow-y-auto">
-                {Object.entries(aiResults).map(([videoId, result]) => {
-                  const video = videos.find((v) => v.id === videoId)
-                  return (
-                    <div key={videoId} className="bg-[#111118] rounded-lg p-3 border border-[#2a2a3a]">
-                      <p className="text-[10px] text-[#55556a] truncate mb-1.5">{video?.filename}</p>
-                      {(result as any).error ? (
-                        <p className="text-[10px] text-red-400">{(result as any).error}</p>
-                      ) : (
-                        <>
-                          {result.description && (
-                            <p className="text-xs text-[#8888aa] mb-1.5 italic">"{result.description}"</p>
-                          )}
-                          <div className="flex flex-wrap gap-1">
-                            {result.tags.map((tag: string) => (
-                              <span key={tag} className="text-[10px] bg-[#6366f1]/20 text-[#6366f1] px-2 py-0.5 rounded-full">
-                                {tag}
-                              </span>
-                            ))}
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
+          {/* Tags — click to toggle on/off for the selected videos */}
+          <div className="flex flex-wrap gap-2 max-h-56 overflow-y-auto">
+            {tags.map((tag) => {
+              const isApplied = appliedTagIds.has(tag.id)
+              const isPending = pendingTagIds.has(tag.id)
+              return (
+                <button
+                  key={tag.id}
+                  onClick={() => toggleTagForVideos(tag.id)}
+                  disabled={isPending || targetVideos.length === 0}
+                  className="group flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs transition-all"
+                  style={{
+                    backgroundColor: isApplied ? `${tag.color}33` : `${tag.color}15`,
+                    color: tag.color,
+                    outline: isApplied ? `2px solid ${tag.color}` : '2px solid transparent',
+                    outlineOffset: '0px',
+                    opacity: isPending ? 0.6 : 1,
+                  }}
+                >
+                  {isPending
+                    ? <Loader2 size={10} className="animate-spin" />
+                    : isApplied
+                      ? <Minus size={10} />
+                      : <Plus size={10} />}
+                  {tag.name}
+                  {/* Delete tag — appears on hover; span (not button) since it's nested */}
+                  <span
+                    role="button"
+                    title={`Delete tag "${tag.name}"`}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      handleDeleteTag(tag)
+                    }}
+                    className="opacity-0 group-hover:opacity-60 hover:!opacity-100 transition-opacity -mr-1"
+                  >
+                    <X size={10} />
+                  </span>
+                </button>
+              )
+            })}
+            {tags.length === 0 && (
+              <p className="text-xs text-[#55556a]">No tags yet.</p>
             )}
           </div>
 
-          {/* Manual tags */}
-          <div>
-            <span className="text-xs font-medium text-[#8888aa] block mb-2">Add Tags</span>
-            <div className="flex flex-wrap gap-2 max-h-40 overflow-y-auto">
-              {tags.map((tag) => {
-                const isApplied = appliedTagIds.has(tag.id)
-                const isPending = pendingTagIds.has(tag.id)
-                return (
+          {/* Subtle link that reveals the create-tag form */}
+          {!showCreateForm ? (
+            <button
+              onClick={() => setShowCreateForm(true)}
+              className="text-xs text-[#55556a] hover:text-[#6366f1] transition-all underline underline-offset-2"
+            >
+              + Create a new tag
+            </button>
+          ) : (
+            <div className="bg-[#111118] border border-[#2a2a3a] rounded-lg p-3 space-y-2">
+              <div className="flex gap-1 flex-wrap">
+                {TAG_COLORS.map((color) => (
                   <button
-                    key={tag.id}
-                    onClick={() => toggleTagForVideos(tag.id)}
-                    disabled={isPending || targetVideos.length === 0}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs transition-all"
+                    key={color}
+                    onClick={() => setSelectedColor(color)}
+                    className="w-5 h-5 rounded-full transition-all flex-shrink-0"
                     style={{
-                      backgroundColor: isApplied ? `${tag.color}33` : `${tag.color}15`,
-                      color: tag.color,
-                      outline: isApplied ? `2px solid ${tag.color}` : '2px solid transparent',
-                      outlineOffset: '0px',
-                      opacity: isPending ? 0.6 : 1,
+                      backgroundColor: color,
+                      outline: selectedColor === color ? `2px solid ${color}` : '2px solid transparent',
+                      outlineOffset: '2px',
                     }}
-                  >
-                    {isPending
-                      ? <Loader2 size={10} className="animate-spin" />
-                      : isApplied
-                        ? <Minus size={10} />
-                        : <Plus size={10} />}
-                    {tag.name}
-                  </button>
-                )
-              })}
-              {tags.length === 0 && (
-                <p className="text-xs text-[#55556a]">No tags yet. Create one below.</p>
-              )}
-            </div>
-          </div>
-
-          {/* Create new tag */}
-          <div>
-            <span className="text-xs font-medium text-[#8888aa] block mb-2">Create New Tag</span>
-            <div className="flex gap-1 flex-wrap mb-2">
-              {TAG_COLORS.map((color) => (
-                <button
-                  key={color}
-                  onClick={() => setSelectedColor(color)}
-                  className="w-5 h-5 rounded-full transition-all flex-shrink-0"
-                  style={{
-                    backgroundColor: color,
-                    outline: selectedColor === color ? `2px solid ${color}` : '2px solid transparent',
-                    outlineOffset: '2px',
-                  }}
+                  />
+                ))}
+              </div>
+              <div className="flex gap-2">
+                <input
+                  autoFocus
+                  type="text"
+                  value={newTagName}
+                  onChange={(e) => setNewTagName(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleCreateTag()}
+                  placeholder="Tag name..."
+                  className="flex-1 bg-[#16161f] border border-[#2a2a3a] rounded-lg px-3 py-1.5 text-sm text-[#e8e8f0] placeholder-[#55556a] outline-none focus:border-[#6366f1] transition-all"
                 />
-              ))}
+                <button
+                  onClick={handleCreateTag}
+                  disabled={!newTagName.trim()}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-[#6366f1] hover:bg-[#7c7ff5] text-white rounded-lg transition-all disabled:opacity-50"
+                >
+                  <Plus size={13} />
+                  Add
+                </button>
+              </div>
             </div>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={newTagName}
-                onChange={(e) => setNewTagName(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleCreateTag()}
-                placeholder="Tag name..."
-                className="flex-1 bg-[#111118] border border-[#2a2a3a] rounded-lg px-3 py-1.5 text-sm text-[#e8e8f0] placeholder-[#55556a] outline-none focus:border-[#6366f1] transition-all"
-              />
-              <button
-                onClick={handleCreateTag}
-                disabled={!newTagName.trim()}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-[#6366f1] hover:bg-[#7c7ff5] text-white rounded-lg transition-all disabled:opacity-50"
-              >
-                <Plus size={13} />
-                Add
-              </button>
-            </div>
-          </div>
+          )}
         </div>
 
         <div className="flex justify-end p-5 border-t border-[#2a2a3a]">

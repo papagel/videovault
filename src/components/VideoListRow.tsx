@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import { Play, Check } from 'lucide-react'
 import { useStore } from '@/store'
 import { cn, formatDuration, formatFileSize, getThumbnailSrc, formatResolution } from '@/lib/utils'
@@ -10,16 +11,20 @@ interface VideoListRowProps {
   onContextMenu?: (e: React.MouseEvent, video: VideoFile) => void
 }
 
-export function VideoListRow({ video, queue, onContextMenu }: VideoListRowProps) {
-  const { selectedVideoIds, toggleVideoSelection, playVideo, setHoveredVideoId } = useStore()
+// Narrow store subscriptions — see VideoCard for rationale.
+export const VideoListRow = memo(function VideoListRow({ video, queue, onContextMenu }: VideoListRowProps) {
+  const isSelected = useStore((s) => s.selectedVideoIds.has(video.id))
+  const toggleVideoSelection = useStore((s) => s.toggleVideoSelection)
+  const playVideo = useStore((s) => s.playVideo)
+  const setHoveredVideoId = useStore((s) => s.setHoveredVideoId)
   const rename = useInlineRename(video)
-  const isSelected = selectedVideoIds.has(video.id)
   const thumbnailSrc = getThumbnailSrc(video.thumbnail_path)
 
   return (
     <div
       className={cn(
-        'flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-all group',
+        // Fixed height — required by the virtualized list (position math)
+        'flex items-center gap-3 px-3 rounded-lg cursor-pointer transition-all group h-14 overflow-hidden',
         isSelected
           ? 'bg-[#1e1e2a] border border-[#6366f1]/40'
           : 'hover:bg-[#16161f] border border-transparent'
@@ -104,4 +109,4 @@ export function VideoListRow({ video, queue, onContextMenu }: VideoListRowProps)
       </div>
     </div>
   )
-}
+})

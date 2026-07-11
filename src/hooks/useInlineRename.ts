@@ -4,7 +4,7 @@ import { useStore } from '@/store'
 import type { VideoFile } from '@/types'
 
 export function useInlineRename(video: VideoFile) {
-  const { updateVideo } = useStore()
+  const updateVideo = useStore((s) => s.updateVideo)
   const [isEditing, setIsEditing] = useState(false)
   const [editName, setEditName] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)

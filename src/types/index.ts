@@ -32,15 +32,7 @@ export interface Collection {
   video_count: number
 }
 
-export interface LlmConfig {
-  provider: 'open_ai' | 'anthropic' | 'google_gemini' | 'ollama'
-  api_key?: string
-  model: string
-  ollama_url?: string
-}
-
 export interface AppSettings {
-  llm: LlmConfig
   autoplay: boolean
   gridSize: 'sm' | 'md' | 'lg'
   defaultView: 'grid' | 'list'

@@ -1,7 +1,50 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Run a command with a hard timeout, killing the process if it exceeds it.
+/// Prevents a single corrupt/partial file from hanging a scan forever.
+/// Stdout/stderr are drained on background threads so a chatty child can't
+/// deadlock on a full pipe buffer.
+fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<std::process::Output> {
+    use std::io::Read;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut s) = stdout_pipe {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut s) = stderr_pipe {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let stdout = out_handle.join().unwrap_or_default();
+            let stderr = err_handle.join().unwrap_or_default();
+            return Ok(std::process::Output { status, stdout, stderr });
+        }
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("process timed out after {:?}", timeout));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
 
 /// Resolve the ffmpeg/ffprobe binary path.
 /// Checks common Homebrew and system locations so the app works
@@ -46,15 +89,15 @@ pub struct VideoMetadata {
 }
 
 pub fn probe_video(path: &str) -> Result<VideoMetadata> {
-    let output = Command::new(ffprobe_bin())
-        .args([
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_streams",
-            "-show_format",
-            path,
-        ])
-        .output()?;
+    let mut cmd = Command::new(ffprobe_bin());
+    cmd.args([
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams",
+        "-show_format",
+        path,
+    ]);
+    let output = run_with_timeout(cmd, Duration::from_secs(15))?;
 
     if !output.status.success() {
         return Err(anyhow!("ffprobe failed for: {}", path));
@@ -113,17 +156,17 @@ fn parse_fps(s: &str) -> f64 {
 
 pub fn extract_thumbnail(video_path: &str, thumb_path: &str, time_secs: f64) -> Result<()> {
     let time_str = format!("{}", time_secs);
-    let status = Command::new(ffmpeg_bin())
-        .args([
-            "-y",
-            "-ss", &time_str,
-            "-i", video_path,
-            "-vframes", "1",
-            "-vf", "scale=320:-1",
-            "-q:v", "3",
-            thumb_path,
-        ])
-        .output()?;
+    let mut cmd = Command::new(ffmpeg_bin());
+    cmd.args([
+        "-y",
+        "-ss", &time_str,
+        "-i", video_path,
+        "-vframes", "1",
+        "-vf", "scale=320:-1",
+        "-q:v", "3",
+        thumb_path,
+    ]);
+    let status = run_with_timeout(cmd, Duration::from_secs(30))?;
 
     if !status.status.success() {
         return Err(anyhow!("ffmpeg thumbnail failed for: {}", video_path));
@@ -131,39 +174,58 @@ pub fn extract_thumbnail(video_path: &str, thumb_path: &str, time_secs: f64) -> 
     Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrimSegment {
     pub start: f64,
     pub end: f64,
 }
 
+pub struct MergeInput {
+    pub path: String,
+    /// Seconds trimmed off the start of this clip before concatenation
+    pub start_offset_secs: f64,
+}
+
 pub fn merge_videos(
-    input_paths: &[String],
+    inputs: &[MergeInput],
     output_path: &str,
     on_progress: impl Fn(f64),
 ) -> Result<()> {
-    if input_paths.is_empty() {
+    if inputs.is_empty() {
         return Err(anyhow!("No input files"));
     }
 
-    let n = input_paths.len();
+    let n = inputs.len();
 
     // Probe each input to know whether it has an audio stream
-    let metadata: Vec<VideoMetadata> = input_paths
+    let metadata: Vec<VideoMetadata> = inputs
         .iter()
-        .map(|p| probe_video(p).unwrap_or(VideoMetadata {
+        .map(|inp| probe_video(&inp.path).unwrap_or(VideoMetadata {
             duration_secs: 0.0, width: 0, height: 0, fps: 0.0,
             codec: String::new(), size_bytes: 0, has_audio: false,
         }))
         .collect();
 
-    let total_duration: f64 = metadata.iter().map(|m| m.duration_secs).sum();
+    // Effective (post-trim) duration per clip — used for progress reporting
+    // and for the silent-audio synthesis of clips without audio.
+    let effective_durations: Vec<f64> = metadata
+        .iter()
+        .zip(inputs)
+        .map(|(m, inp)| (m.duration_secs - inp.start_offset_secs).max(0.0))
+        .collect();
 
-    // Build -i args
+    let total_duration: f64 = effective_durations.iter().sum();
+
+    // Build input args. `-ss` BEFORE `-i` performs fast input-level seeking,
+    // so the trimmed head is never decoded.
     let mut args: Vec<String> = vec!["-y".into()];
-    for path in input_paths {
+    for inp in inputs {
+        if inp.start_offset_secs > 0.0 {
+            args.push("-ss".into());
+            args.push(format!("{}", inp.start_offset_secs));
+        }
         args.push("-i".into());
-        args.push(path.clone());
+        args.push(inp.path.clone());
     }
 
     // Build filter_complex dynamically.
@@ -190,8 +252,8 @@ pub fn merge_videos(
                 "[{i}:a]aformat=sample_rates=44100:channel_layouts=stereo{a_label}"
             ));
         } else {
-            // Synthesise silence matching the video duration
-            let dur = meta.duration_secs;
+            // Synthesise silence matching the post-trim video duration
+            let dur = effective_durations[i];
             filter_parts.push(format!(
                 "anullsrc=r=44100:cl=stereo:d={dur}{a_label}"
             ));
@@ -260,6 +322,10 @@ pub fn merge_videos(
     Ok(())
 }
 
+/// Keep only the given segments of the input, concatenated in order.
+/// Always re-encodes for frame-accurate cuts (stream-copy can only cut on
+/// keyframes, which shifts cut points by up to several seconds).
+/// Handles inputs without an audio stream.
 pub fn trim_video(
     input_path: &str,
     output_path: &str,
@@ -269,78 +335,73 @@ pub fn trim_video(
         return Err(anyhow!("No segments provided"));
     }
 
-    if segments.len() == 1 {
-        // Simple single-segment trim
-        let seg = &segments[0];
-        let duration = seg.end - seg.start;
-        Command::new(ffmpeg_bin())
-            .args([
-                "-y",
-                "-ss", &format!("{}", seg.start),
-                "-i", input_path,
-                "-t", &format!("{}", duration),
-                "-c", "copy",
-                output_path,
-            ])
-            .output()?;
-        return Ok(());
-    }
+    let has_audio = probe_video(input_path).map(|m| m.has_audio).unwrap_or(false);
+    let n = segments.len();
 
-    // Multi-segment: use complex filter
     let mut filter_parts = Vec::new();
     let mut concat_inputs = String::new();
-    let n = segments.len();
 
     for (i, seg) in segments.iter().enumerate() {
         filter_parts.push(format!(
-            "[0:v]trim=start={}:end={},setpts=PTS-STARTPTS[v{}];[0:a]atrim=start={}:end={},asetpts=PTS-STARTPTS[a{}]",
-            seg.start, seg.end, i, seg.start, seg.end, i
+            "[0:v]trim=start={}:end={},setpts=PTS-STARTPTS[v{}]",
+            seg.start, seg.end, i
         ));
-        concat_inputs.push_str(&format!("[v{}][a{}]", i, i));
-    }
-
-    let filter = format!(
-        "{};{}concat=n={}:v=1:a=1[outv][outa]",
-        filter_parts.join(";"),
-        concat_inputs,
-        n
-    );
-
-    Command::new(ffmpeg_bin())
-        .args([
-            "-y",
-            "-i", input_path,
-            "-filter_complex", &filter,
-            "-map", "[outv]",
-            "-map", "[outa]",
-            output_path,
-        ])
-        .output()?;
-
-    Ok(())
-}
-
-pub fn extract_frames_for_tagging(video_path: &str, output_dir: &str, count: u32) -> Result<Vec<String>> {
-    std::fs::create_dir_all(output_dir)?;
-
-    let metadata = probe_video(video_path)?;
-    let duration = metadata.duration_secs;
-
-    let mut frame_paths = Vec::new();
-    for i in 0..count {
-        let t = if count > 1 {
-            duration * (i as f64 + 0.5) / count as f64
+        if has_audio {
+            filter_parts.push(format!(
+                "[0:a]atrim=start={}:end={},asetpts=PTS-STARTPTS[a{}]",
+                seg.start, seg.end, i
+            ));
+            concat_inputs.push_str(&format!("[v{}][a{}]", i, i));
         } else {
-            duration * 0.1
-        };
-
-        let frame_path = format!("{}/frame_{}.jpg", output_dir, i);
-        if extract_thumbnail(video_path, &frame_path, t).is_ok() {
-            frame_paths.push(frame_path);
+            concat_inputs.push_str(&format!("[v{}]", i));
         }
     }
 
-    Ok(frame_paths)
+    let filter = if has_audio {
+        format!(
+            "{};{}concat=n={}:v=1:a=1[outv][outa]",
+            filter_parts.join(";"),
+            concat_inputs,
+            n
+        )
+    } else {
+        format!(
+            "{};{}concat=n={}:v=1:a=0[outv]",
+            filter_parts.join(";"),
+            concat_inputs,
+            n
+        )
+    };
+
+    let mut args: Vec<String> = vec![
+        "-y".into(),
+        "-i".into(), input_path.into(),
+        "-filter_complex".into(), filter,
+        "-map".into(), "[outv]".into(),
+    ];
+    if has_audio {
+        args.extend(["-map".into(), "[outa]".into()]);
+        args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
+    }
+    args.extend([
+        "-c:v".into(), "libx264".into(),
+        "-crf".into(), "20".into(),
+        "-preset".into(), "fast".into(),
+        "-movflags".into(), "+faststart".into(),
+        output_path.into(),
+    ]);
+
+    let output = Command::new(ffmpeg_bin()).args(&args).output()?;
+    if !output.status.success() {
+        let stderr_text = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "FFmpeg trim failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr_text.lines().rev().take(5).collect::<Vec<_>>().join(" | ")
+        ));
+    }
+
+    Ok(())
 }
 
 pub fn is_ffmpeg_available() -> bool {

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback } from 'react'
+import { useEffect, useRef } from 'react'
 import { X, Volume2, VolumeX } from 'lucide-react'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { useStore } from '@/store'

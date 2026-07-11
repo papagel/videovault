@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { Play, Check, HardDrive } from 'lucide-react'
+import { useState, memo } from 'react'
+import { Play, Check, HardDrive, ListVideo } from 'lucide-react'
 import { useStore } from '@/store'
 import { cn, formatDuration, formatFileSize, getThumbnailSrc, formatResolution } from '@/lib/utils'
 import { useInlineRename } from '@/hooks/useInlineRename'
@@ -12,18 +12,25 @@ interface VideoCardProps {
   onContextMenu?: (e: React.MouseEvent, video: VideoFile) => void
 }
 
-export function VideoCard({ video, size, queue, onContextMenu }: VideoCardProps) {
-  const { selectedVideoIds, toggleVideoSelection, playVideo, setHoveredVideoId } = useStore()
+// Narrow store subscriptions: the card only re-renders when ITS OWN selection
+// flag flips (boolean selector) — not on hover/playback/scan store changes.
+export const VideoCard = memo(function VideoCard({ video, size, queue, onContextMenu }: VideoCardProps) {
+  const isSelected = useStore((s) => s.selectedVideoIds.has(video.id))
+  const toggleVideoSelection = useStore((s) => s.toggleVideoSelection)
+  const playVideo = useStore((s) => s.playVideo)
+  const setHoveredVideoId = useStore((s) => s.setHoveredVideoId)
+  const memberCollections = useStore((s) => s.videoCollections[video.id])
   const [hovered, setHovered] = useState(false)
   const rename = useInlineRename(video)
-  const isSelected = selectedVideoIds.has(video.id)
 
   const thumbnailSrc = getThumbnailSrc(video.thumbnail_path)
 
-  const cardSizes = {
-    sm: 'w-36',
-    md: 'w-48',
-    lg: 'w-64',
+  // Fixed card heights per size — required by the virtualized grid, which
+  // positions cards with pure math instead of measuring the DOM.
+  const cardHeights = {
+    sm: 'h-[124px]',
+    md: 'h-[204px]',
+    lg: 'h-[236px]',
   }
 
   const thumbHeights = {
@@ -35,12 +42,12 @@ export function VideoCard({ video, size, queue, onContextMenu }: VideoCardProps)
   return (
     <div
       className={cn(
-        'group relative flex flex-col rounded-lg overflow-hidden cursor-pointer',
+        'group relative flex flex-col rounded-lg overflow-hidden cursor-pointer w-full',
         'border transition-all duration-150',
         isSelected
           ? 'border-[#6366f1] ring-1 ring-[#6366f1]/30 bg-[#16161f]'
           : 'border-[#2a2a3a] hover:border-[#3a3a5a] bg-[#111118]',
-        cardSizes[size]
+        cardHeights[size]
       )}
       onMouseEnter={() => { setHovered(true); setHoveredVideoId(video.id) }}
       onMouseLeave={() => { setHovered(false); setHoveredVideoId(null) }}
@@ -54,7 +61,7 @@ export function VideoCard({ video, size, queue, onContextMenu }: VideoCardProps)
       }}
     >
       {/* Thumbnail */}
-      <div className={cn('relative overflow-hidden bg-[#0d0d14]', thumbHeights[size])}>
+      <div className={cn('relative overflow-hidden bg-[#0d0d14] flex-shrink-0', thumbHeights[size])}>
         {thumbnailSrc ? (
           <img
             src={thumbnailSrc}
@@ -85,6 +92,17 @@ export function VideoCard({ video, size, queue, onContextMenu }: VideoCardProps)
           {formatDuration(video.duration_secs)}
         </div>
 
+        {/* Collection badge — shown when the video belongs to collections */}
+        {memberCollections && memberCollections.length > 0 && (
+          <div
+            className="absolute bottom-1.5 left-1.5 flex items-center gap-1 bg-[#6366f1]/90 rounded px-1 py-0.5 text-[9px] text-white font-medium"
+            title={`In: ${memberCollections.join(', ')}`}
+          >
+            <ListVideo size={9} />
+            {memberCollections.length > 1 && <span>{memberCollections.length}</span>}
+          </div>
+        )}
+
         {/* Selection checkbox */}
         <button
           className={cn(
@@ -101,16 +119,16 @@ export function VideoCard({ video, size, queue, onContextMenu }: VideoCardProps)
           {isSelected && <Check size={12} className="text-white m-auto" />}
         </button>
 
-        {/* Resolution badge */}
-        {video.width > 0 && (
+        {/* Resolution badge — only shown for 1080p and above */}
+        {video.height >= 1080 && (
           <div className="absolute top-1.5 right-1.5 bg-black/70 rounded px-1 py-0.5 text-[9px] text-[#aaaacc]">
             {formatResolution(video.width, video.height)}
           </div>
         )}
       </div>
 
-      {/* Info */}
-      <div className="p-2 flex-1 flex flex-col gap-1">
+      {/* Info — overflow hidden keeps the fixed card height exact */}
+      <div className="p-2 flex-1 flex flex-col gap-1 overflow-hidden min-h-0">
         {rename.isEditing ? (
           <input
             ref={rename.inputRef}
@@ -120,11 +138,14 @@ export function VideoCard({ video, size, queue, onContextMenu }: VideoCardProps)
             onBlur={rename.commit}
             onClick={(e) => e.stopPropagation()}
             autoFocus
-            className="w-full text-xs bg-[#2a2a3a] text-[#e8e8f0] rounded px-1 py-0.5 outline-none border border-[#6366f1]"
+            className="w-full text-xs bg-[#2a2a3a] text-[#e8e8f0] rounded px-1 py-0.5 outline-none border border-[#6366f1] flex-shrink-0"
           />
         ) : (
           <p
-            className="text-xs text-[#e8e8f0] font-medium leading-tight line-clamp-2 cursor-text"
+            className={cn(
+              'text-xs text-[#e8e8f0] font-medium leading-tight cursor-text flex-shrink-0',
+              video.tags.length > 0 ? 'truncate' : 'line-clamp-2'
+            )}
             title="Click to rename"
             onClick={rename.startEdit}
           >
@@ -133,7 +154,7 @@ export function VideoCard({ video, size, queue, onContextMenu }: VideoCardProps)
         )}
 
         {size !== 'sm' && (
-          <div className="flex items-center gap-2 text-[10px] text-[#55556a]">
+          <div className="flex items-center gap-2 text-[10px] text-[#55556a] flex-shrink-0">
             <span className="flex items-center gap-1">
               <HardDrive size={9} />
               {formatFileSize(video.size_bytes)}
@@ -144,24 +165,24 @@ export function VideoCard({ video, size, queue, onContextMenu }: VideoCardProps)
           </div>
         )}
 
-        {/* Tags */}
-        {video.tags.length > 0 && (
-          <div className="flex flex-wrap gap-1 mt-0.5">
+        {/* Tags — single row, hidden on sm where there's no room */}
+        {video.tags.length > 0 && size !== 'sm' && (
+          <div className="flex gap-1 mt-0.5 flex-shrink-0 overflow-hidden">
             {video.tags.slice(0, 3).map((tag) => (
               <span
                 key={tag.id}
-                className="text-[9px] px-1.5 py-0.5 rounded-full font-medium"
+                className="text-[9px] px-1.5 py-0.5 rounded-full font-medium flex-shrink-0"
                 style={{ backgroundColor: `${tag.color}22`, color: tag.color }}
               >
                 {tag.name}
               </span>
             ))}
             {video.tags.length > 3 && (
-              <span className="text-[9px] text-[#55556a]">+{video.tags.length - 3}</span>
+              <span className="text-[9px] text-[#55556a] flex-shrink-0">+{video.tags.length - 3}</span>
             )}
           </div>
         )}
       </div>
     </div>
   )
-}
+})

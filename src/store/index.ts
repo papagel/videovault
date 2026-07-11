@@ -13,6 +13,8 @@ interface PlayerState {
   duration: number
   isFullscreen: boolean
   shuffleEnabled: boolean
+  /** Bumped on every playVideo call so the Player can re-open even for the same video */
+  playbackKey: number
 }
 
 interface UIState {
@@ -22,6 +24,7 @@ interface UIState {
   selectedVideoIds: Set<string>
   activeFolder: string | null
   activeTags: string[]
+  tagFilterMode: 'and' | 'or'
   activeCollection: string | null
   searchQuery: string
   sortField: SortField
@@ -37,8 +40,15 @@ interface UIState {
   quickPreviewVideo: VideoFile | null
   hoveredVideoId: string | null
   scrollToVideoId: string | null
+  sidebarWidth: number
   pendingDeleteIds: Set<string>
   pendingDelete: { ids: string[]; label: string } | null
+  /** Folders whose subfolder tree is collapsed in the sidebar */
+  condensedFolders: Set<string>
+  /** IDs of the currently filtered/visible videos (kept by VideoGrid).
+      Used by Cmd+A now that the grid is virtualized and the DOM only
+      contains a viewport's worth of cards. */
+  filteredVideoIds: string[]
 }
 
 interface DataState {
@@ -47,6 +57,8 @@ interface DataState {
   collections: Collection[]
   watchedFolders: string[]
   stats: { total_videos: number; total_size_bytes: number; total_duration_secs: number } | null
+  /** video id → names of the collections it belongs to (for thumbnail badges) */
+  videoCollections: Record<string, string[]>
 }
 
 interface AppStore extends PlayerState, UIState, DataState {
@@ -75,6 +87,9 @@ interface AppStore extends PlayerState, UIState, DataState {
   selectByIds: (ids: string[]) => void
   setActiveFolder: (folder: string | null) => void
   setActiveTags: (tags: string[]) => void
+  setTagFilterMode: (mode: 'and' | 'or') => void
+  toggleFolderCondensed: (folder: string) => void
+  setFilteredVideoIds: (ids: string[]) => void
   setActiveCollection: (id: string | null) => void
   setSearchQuery: (q: string) => void
   setSortField: (f: SortField) => void
@@ -89,6 +104,7 @@ interface AppStore extends PlayerState, UIState, DataState {
   setQuickPreviewVideo: (v: VideoFile | null) => void
   setHoveredVideoId: (id: string | null) => void
   setScrollToVideoId: (id: string | null) => void
+  setSidebarWidth: (w: number) => void
   setPendingDeleteIds: (ids: Set<string>) => void
   setPendingDelete: (v: { ids: string[]; label: string } | null) => void
   triggerDelete: (ids: string[]) => void
@@ -98,21 +114,18 @@ interface AppStore extends PlayerState, UIState, DataState {
   addVideos: (videos: VideoFile[]) => void
   updateVideo: (id: string, updates: Partial<VideoFile>) => void
   removeVideos: (ids: string[]) => void
+  removeVideoByPath: (path: string) => void
   setTags: (tags: Tag[]) => void
   addTag: (tag: Tag) => void
   setCollections: (collections: Collection[]) => void
   addCollection: (collection: Collection) => void
+  setVideoCollections: (map: Record<string, string[]>) => void
   setWatchedFolders: (folders: string[]) => void
   setStats: (stats: DataState['stats']) => void
   updateSettings: (updates: Partial<AppSettings>) => void
 }
 
 const defaultSettings: AppSettings = {
-  llm: {
-    provider: 'ollama',
-    model: 'llava',
-    ollama_url: 'http://localhost:11434',
-  },
   autoplay: true,
   gridSize: 'md',
   defaultView: 'grid',
@@ -121,7 +134,7 @@ const defaultSettings: AppSettings = {
 
 export const useStore = create<AppStore>()(
   persist(
-    (set, get) => ({
+    (set, _get) => ({
       // Player state
       currentVideo: null,
       queue: [],
@@ -133,6 +146,7 @@ export const useStore = create<AppStore>()(
       duration: 0,
       isFullscreen: false,
       shuffleEnabled: false,
+      playbackKey: 0,
 
       // UI state
       view: 'grid',
@@ -141,6 +155,7 @@ export const useStore = create<AppStore>()(
       selectedVideoIds: new Set(),
       activeFolder: null,
       activeTags: [],
+      tagFilterMode: 'and',
       activeCollection: null,
       searchQuery: '',
       sortField: 'filename',
@@ -156,8 +171,11 @@ export const useStore = create<AppStore>()(
       quickPreviewVideo: null,
       hoveredVideoId: null,
       scrollToVideoId: null,
+      sidebarWidth: 224,
       pendingDeleteIds: new Set<string>(),
       pendingDelete: null,
+      condensedFolders: new Set<string>(),
+      filteredVideoIds: [],
 
       // Data state
       videos: [],
@@ -165,6 +183,7 @@ export const useStore = create<AppStore>()(
       collections: [],
       watchedFolders: [],
       stats: null,
+      videoCollections: {},
 
       settings: defaultSettings,
 
@@ -178,6 +197,7 @@ export const useStore = create<AppStore>()(
             queue: q,
             queueIndex: idx >= 0 ? idx : 0,
             isPlaying: true,
+            playbackKey: state.playbackKey + 1,
           }
         }),
 
@@ -248,7 +268,16 @@ export const useStore = create<AppStore>()(
 
       setActiveFolder: (folder) => set({ activeFolder: folder, activeCollection: null }),
       setActiveTags: (tags) => set({ activeTags: tags }),
-      setActiveCollection: (id) => set({ activeCollection: id, activeFolder: null }),
+      setTagFilterMode: (mode) => set({ tagFilterMode: mode }),
+      toggleFolderCondensed: (folder) =>
+        set((state) => {
+          const next = new Set(state.condensedFolders)
+          if (next.has(folder)) next.delete(folder)
+          else next.add(folder)
+          return { condensedFolders: next }
+        }),
+      setFilteredVideoIds: (ids) => set({ filteredVideoIds: ids }),
+      setActiveCollection: (id) => set({ activeCollection: id, activeFolder: null, activeTags: [] }),
       setSearchQuery: (q) => set({ searchQuery: q }),
       setSortField: (f) => set({ sortField: f }),
       setSortDir: (d) => set({ sortDir: d }),
@@ -265,6 +294,7 @@ export const useStore = create<AppStore>()(
       setQuickPreviewVideo: (v) => set({ quickPreviewVideo: v }),
       setHoveredVideoId: (id) => set({ hoveredVideoId: id }),
       setScrollToVideoId: (id) => set({ scrollToVideoId: id }),
+      setSidebarWidth: (w) => set({ sidebarWidth: Math.max(160, Math.min(480, w)) }),
       setPendingDeleteIds: (ids) => set({ pendingDeleteIds: ids }),
       setPendingDelete: (v) => set({ pendingDelete: v }),
       triggerDelete: (ids) => {
@@ -296,11 +326,21 @@ export const useStore = create<AppStore>()(
             [...state.selectedVideoIds].filter((id) => !ids.includes(id))
           ),
         })),
+      removeVideoByPath: (path) =>
+        set((state) => ({
+          videos: state.videos.filter((v) => v.path !== path),
+          selectedVideoIds: new Set(
+            [...state.selectedVideoIds].filter(
+              (id) => !state.videos.find((v) => v.path === path && v.id === id)
+            )
+          ),
+        })),
       setTags: (tags) => set({ tags }),
       addTag: (tag) => set((state) => ({ tags: [...state.tags, tag] })),
       setCollections: (collections) => set({ collections }),
       addCollection: (collection) =>
         set((state) => ({ collections: [...state.collections, collection] })),
+      setVideoCollections: (map) => set({ videoCollections: map }),
       setWatchedFolders: (folders) => set({ watchedFolders: folders }),
       setStats: (stats) => set({ stats }),
       updateSettings: (updates) =>
@@ -313,8 +353,10 @@ export const useStore = create<AppStore>()(
         view: state.view,
         gridSize: state.gridSize,
         sidebarOpen: state.sidebarOpen,
+        sidebarWidth: state.sidebarWidth,
         volume: state.volume,
         watchedFolders: state.watchedFolders,
+        tagFilterMode: state.tagFilterMode,
       }),
     }
   )

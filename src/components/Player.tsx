@@ -19,6 +19,7 @@ export function Player() {
     queue,
     queueIndex,
     shuffleEnabled,
+    playbackKey,
     settings,
     setPlaying,
     setVolume,
@@ -30,7 +31,6 @@ export function Player() {
     playRandom,
     setShuffleEnabled,
     updateVideo,
-    clearSelection,
     toggleVideoSelection,
     setScrollToVideoId,
   } = useStore()
@@ -41,19 +41,23 @@ export function Player() {
   const closePlayer = useCallback(() => {
     setShowPlayer(false)
     if (currentVideo) {
-      clearSelection()
-      toggleVideoSelection(currentVideo.id)
+      // Keep whatever selection the user had. Only when nothing was selected,
+      // select the played video as a convenience for follow-up actions.
+      if (useStore.getState().selectedVideoIds.size === 0) {
+        toggleVideoSelection(currentVideo.id)
+      }
       setScrollToVideoId(currentVideo.id)
     }
-  }, [currentVideo, clearSelection, toggleVideoSelection, setScrollToVideoId])
+  }, [currentVideo, toggleVideoSelection, setScrollToVideoId])
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [controlsVisible, setControlsVisible] = useState(true)
   const hideControlsTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // Show player modal when video is selected
+  // Show player modal whenever a video is played (playbackKey bumps on every
+  // playVideo call, so re-clicking the same video after Esc works too)
   useEffect(() => {
     if (currentVideo) setShowPlayer(true)
-  }, [currentVideo?.id])
+  }, [playbackKey])
 
   // Auto-play when video element mounts (key prop handles remount)
   const handleVideoReady = useCallback(() => {

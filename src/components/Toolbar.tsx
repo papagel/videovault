@@ -1,28 +1,49 @@
 import { invoke } from '@tauri-apps/api/core'
-// invoke used for folder scanning below
 import { open } from '@tauri-apps/plugin-dialog'
+import { useShallow } from 'zustand/react/shallow'
 import {
   Grid3X3, List, FolderPlus, Merge,
   Scissors, Tag, Trash2, SortAsc, SortDesc, ChevronDown,
-  PanelLeftClose, PanelLeft, Sparkles,
+  PanelLeftClose, PanelLeft,
 } from 'lucide-react'
 import { useStore } from '@/store'
 import { cn } from '@/lib/utils'
-import type { SortField, VideoFile } from '@/types'
+import type { SortField } from '@/types'
 
 export function Toolbar() {
   const {
-    view, gridSize, sidebarOpen, searchQuery, sortField, sortDir,
-    selectedVideoIds, videos, isScanning,
-    setView, setGridSize, toggleSidebar, setSearchQuery,
+    view, gridSize, sidebarOpen, sortField, sortDir,
+    selectedVideoIds,
+    setView, setGridSize, toggleSidebar,
     setSortField, setSortDir,
     setShowMergeModal, setShowTrimModal, setShowTagModal,
     setShowRenameModal,
-    addVideos, setWatchedFolders, setScanning,
-  } = useStore()
+    setWatchedFolders, setScanning,
+    triggerDelete,
+  } = useStore(
+    useShallow((s) => ({
+      view: s.view,
+      gridSize: s.gridSize,
+      sidebarOpen: s.sidebarOpen,
+      sortField: s.sortField,
+      sortDir: s.sortDir,
+      selectedVideoIds: s.selectedVideoIds,
+      setView: s.setView,
+      setGridSize: s.setGridSize,
+      toggleSidebar: s.toggleSidebar,
+      setSortField: s.setSortField,
+      setSortDir: s.setSortDir,
+      setShowMergeModal: s.setShowMergeModal,
+      setShowTrimModal: s.setShowTrimModal,
+      setShowTagModal: s.setShowTagModal,
+      setShowRenameModal: s.setShowRenameModal,
+      setWatchedFolders: s.setWatchedFolders,
+      setScanning: s.setScanning,
+      triggerDelete: s.triggerDelete,
+    }))
+  )
 
   const selectedCount = selectedVideoIds.size
-  const selectedVideos = videos.filter((v) => selectedVideoIds.has(v.id))
 
   const handleAddFolder = async () => {
     const selected = await open({ directory: true, multiple: false })
@@ -31,12 +52,9 @@ export function Toolbar() {
     const folders = await invoke<string[]>('get_watched_folders')
     setWatchedFolders(folders)
     setScanning(true, { total: 0, processed: 0, current_file: 'Scanning...' })
-    const scanned = await invoke<VideoFile[]>('scan_folder', { folderPath: selected })
-    addVideos(scanned)
-    setScanning(false)
+    // Fire-and-forget: videos stream in via video-found events; scan-complete clears the state
+    invoke('scan_folder_background', { folderPath: selected }).catch(console.error)
   }
-
-  const { triggerDelete } = useStore()
 
   const handleDeleteSelected = () => {
     const ids = [...selectedVideoIds]
@@ -118,9 +136,7 @@ export function Toolbar() {
           {selectedCount === 1 && (
             <ToolbarActionButton onClick={() => setShowTrimModal(true)} title="Trim" icon={<Scissors size={13} />} />
           )}
-          {selectedCount === 1 && (
-            <ToolbarActionButton onClick={() => setShowRenameModal(true)} title="Rename" icon={<span className="text-[11px] font-bold">Aa</span>} />
-          )}
+          <ToolbarActionButton onClick={() => setShowRenameModal(true)} title="Rename" icon={<span className="text-[11px] font-bold">Aa</span>} />
           <ToolbarActionButton onClick={() => setShowTagModal(true)} title="Tag" icon={<Tag size={13} />} />
           <ToolbarActionButton onClick={handleDeleteSelected} title="Delete" icon={<Trash2 size={13} />} danger />
         </div>
