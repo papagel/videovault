@@ -2,8 +2,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type {
   VideoFile, Tag, Collection, AppSettings, SortField, SortDir,
-  MageArchitecture, MageConfig, MageEntity, MageGeneration,
-} from '@/types'
+  MageArchitecture, MageConfig, MageEntity, MageGeneration, MergePreset } from '@/types'
 
 interface PlayerState {
   currentVideo: VideoFile | null
@@ -18,6 +17,8 @@ interface PlayerState {
   shuffleEnabled: boolean
   /** Bumped on every playVideo call so the Player can re-open even for the same video */
   playbackKey: number
+  /** Select the played video when the player closes (if nothing else is) */
+  selectPlayedOnClose: boolean
 }
 
 interface UIState {
@@ -25,7 +26,12 @@ interface UIState {
   gridSize: 'sm' | 'md' | 'lg'
   sidebarOpen: boolean
   selectedVideoIds: Set<string>
-  activeFolder: string | null
+  /** Folders whose videos are shown together; empty shows every folder */
+  activeFolders: string[]
+  /** Only show videos whose filename starts with this character */
+  letterFilter: string | null
+  /** Folders shown most recently, newest first (for the folder picker) */
+  recentFolders: string[]
   activeTags: string[]
   tagFilterMode: 'and' | 'or'
   activeCollection: string | null
@@ -35,6 +41,13 @@ interface UIState {
   isScanning: boolean
   scanProgress: { total: number; processed: number; current_file: string } | null
   showMergeModal: boolean
+  /** Fixed clips for the next Merge dialog (intro merges); cleared on close */
+  mergePreset: MergePreset | null
+  /** A one-click 8-second mix in progress (0–1), or its error */
+  quickMixStatus: { progress: number; error?: undefined } | { progress?: undefined; error: string } | null
+  setQuickMixStatus: (s: AppStore['quickMixStatus']) => void
+  /** Video waiting for a character to be picked for "Merge with intro" */
+  introPickVideo: { video: VideoFile; preferHandles: string[] } | null
   showTrimModal: boolean
   showTagModal: boolean
   showSettingsModal: boolean
@@ -88,14 +101,15 @@ interface MageState {
   mageEntities: MageEntity[]
   mageDraft: MageDraft
   /** Create-character/reference dialog, optionally prefilled with an image */
-  mageEntityModal: { type: 'character' | 'reference'; filePath?: string } | null
+  mageEntityModal: { type: 'character' | 'reference'; filePath?: string; entity?: MageEntity } | null
 }
 
 interface AppStore extends PlayerState, UIState, DataState, MageState {
   settings: AppSettings
 
   // Player actions
-  playVideo: (video: VideoFile, queue?: VideoFile[]) => void
+  /** `selectOnClose: false` leaves the selection empty when the player closes */
+  playVideo: (video: VideoFile, queue?: VideoFile[], opts?: { selectOnClose?: boolean }) => void
   playNext: () => void
   playPrev: () => void
   setPlaying: (v: boolean) => void
@@ -115,7 +129,12 @@ interface AppStore extends PlayerState, UIState, DataState, MageState {
   selectAll: () => void
   clearSelection: () => void
   selectByIds: (ids: string[]) => void
+  /** Show just this folder (or every folder, with null) */
   setActiveFolder: (folder: string | null) => void
+  /** Add a folder to the ones shown, or take it out */
+  toggleActiveFolder: (folder: string) => void
+  setActiveFolders: (folders: string[]) => void
+  setLetterFilter: (letter: string | null) => void
   setActiveTags: (tags: string[]) => void
   setTagFilterMode: (mode: 'and' | 'or') => void
   toggleFolderCondensed: (folder: string) => void
@@ -126,6 +145,8 @@ interface AppStore extends PlayerState, UIState, DataState, MageState {
   setSortDir: (d: SortDir) => void
   setScanning: (v: boolean, progress?: UIState['scanProgress']) => void
   setShowMergeModal: (v: boolean) => void
+  openMergePreset: (preset: MergePreset) => void
+  setIntroPickVideo: (v: { video: VideoFile; preferHandles: string[] } | null) => void
   setShowTrimModal: (v: boolean) => void
   setShowTagModal: (v: boolean) => void
   setShowSettingsModal: (v: boolean) => void
@@ -165,6 +186,8 @@ interface AppStore extends PlayerState, UIState, DataState, MageState {
   setMageEntities: (entities: MageEntity[]) => void
   addMageEntity: (entity: MageEntity) => void
   removeMageEntity: (id: string) => void
+  /** Swap an entity for its edited copy (edits save a new entity on Mage) */
+  replaceMageEntity: (oldId: string, entity: MageEntity) => void
   updateMageDraft: (updates: Partial<MageDraft>) => void
   setMageEntityModal: (v: MageState['mageEntityModal']) => void
 }
@@ -179,11 +202,21 @@ const defaultMageDraft: MageDraft = {
   lastFrame: null,
 }
 
+/** Put a folder at the front of the recent list (kept to 8). */
+function withRecent(recent: string[], folder: string): string[] {
+  return [folder, ...recent.filter((f) => f !== folder)].slice(0, 8)
+}
+
 const defaultSettings: AppSettings = {
   autoplay: true,
   gridSize: 'md',
   defaultView: 'grid',
   volume: 0.8,
+  mageConfirmGems: 500,
+  mageThumbSize: 'md',
+  mageThumbFit: 'cover',
+  mageTrashOnRemove: false,
+  mergeQuality: 'high',
 }
 
 export const useStore = create<AppStore>()(
@@ -201,13 +234,16 @@ export const useStore = create<AppStore>()(
       isFullscreen: false,
       shuffleEnabled: false,
       playbackKey: 0,
+      selectPlayedOnClose: true,
 
       // UI state
       view: 'grid',
       gridSize: 'md',
       sidebarOpen: true,
       selectedVideoIds: new Set(),
-      activeFolder: null,
+      activeFolders: [],
+      letterFilter: null,
+      recentFolders: [],
       activeTags: [],
       tagFilterMode: 'and',
       activeCollection: null,
@@ -217,6 +253,10 @@ export const useStore = create<AppStore>()(
       isScanning: false,
       scanProgress: null,
       showMergeModal: false,
+      mergePreset: null,
+      introPickVideo: null,
+      quickMixStatus: null,
+      setQuickMixStatus: (quickMixStatus) => set({ quickMixStatus }),
       showTrimModal: false,
       showTagModal: false,
       showSettingsModal: false,
@@ -252,11 +292,12 @@ export const useStore = create<AppStore>()(
       mageEntityModal: null,
 
       // Player actions
-      playVideo: (video, queue) =>
+      playVideo: (video, queue, opts) =>
         set((state) => {
           const q = queue || state.videos
           const idx = q.findIndex((v) => v.id === video.id)
           return {
+            selectPlayedOnClose: opts?.selectOnClose ?? true,
             currentVideo: video,
             queue: q,
             queueIndex: idx >= 0 ? idx : 0,
@@ -330,7 +371,25 @@ export const useStore = create<AppStore>()(
       clearSelection: () => set({ selectedVideoIds: new Set() }),
       selectByIds: (ids: string[]) => set({ selectedVideoIds: new Set(ids) }),
 
-      setActiveFolder: (folder) => set({ activeFolder: folder, activeCollection: null }),
+      setActiveFolder: (folder) =>
+        set((state) => ({
+          activeFolders: folder ? [folder] : [],
+          activeCollection: null,
+          recentFolders: folder ? withRecent(state.recentFolders, folder) : state.recentFolders,
+        })),
+      toggleActiveFolder: (folder) =>
+        set((state) => {
+          const removing = state.activeFolders.includes(folder)
+          return {
+            activeFolders: removing
+              ? state.activeFolders.filter((f) => f !== folder)
+              : [...state.activeFolders, folder],
+            activeCollection: null,
+            recentFolders: removing ? state.recentFolders : withRecent(state.recentFolders, folder),
+          }
+        }),
+      setActiveFolders: (folders) => set({ activeFolders: folders }),
+      setLetterFilter: (letter) => set({ letterFilter: letter }),
       setActiveTags: (tags) => set({ activeTags: tags }),
       setTagFilterMode: (mode) => set({ tagFilterMode: mode }),
       toggleFolderCondensed: (folder) =>
@@ -341,7 +400,7 @@ export const useStore = create<AppStore>()(
           return { condensedFolders: next }
         }),
       setFilteredVideoIds: (ids) => set({ filteredVideoIds: ids }),
-      setActiveCollection: (id) => set({ activeCollection: id, activeFolder: null, activeTags: [] }),
+      setActiveCollection: (id) => set({ activeCollection: id, activeFolders: [], activeTags: [] }),
       setSearchQuery: (q) => set({ searchQuery: q }),
       setSortField: (f) => set({ sortField: f }),
       setSortDir: (d) => set({ sortDir: d }),
@@ -349,7 +408,9 @@ export const useStore = create<AppStore>()(
       setScanning: (v, progress) =>
         set({ isScanning: v, scanProgress: progress ?? null }),
 
-      setShowMergeModal: (v) => set({ showMergeModal: v }),
+      setShowMergeModal: (v) => set(v ? { showMergeModal: true } : { showMergeModal: false, mergePreset: null }),
+      openMergePreset: (preset) => set({ mergePreset: preset, showMergeModal: true, introPickVideo: null }),
+      setIntroPickVideo: (v) => set({ introPickVideo: v }),
       setShowTrimModal: (v) => set({ showTrimModal: v }),
       setShowTagModal: (v) => set({ showTagModal: v }),
       setShowSettingsModal: (v) => set({ showSettingsModal: v }),
@@ -432,6 +493,8 @@ export const useStore = create<AppStore>()(
         set((state) => ({ mageEntities: [entity, ...state.mageEntities.filter((e) => e.id !== entity.id)] })),
       removeMageEntity: (id) =>
         set((state) => ({ mageEntities: state.mageEntities.filter((e) => e.id !== id) })),
+      replaceMageEntity: (oldId, entity) =>
+        set((state) => ({ mageEntities: state.mageEntities.map((e) => (e.id === oldId ? entity : e)) })),
       updateMageDraft: (updates) =>
         set((state) => ({ mageDraft: { ...state.mageDraft, ...updates } })),
       setMageEntityModal: (v) => set({ mageEntityModal: v }),
@@ -449,11 +512,17 @@ export const useStore = create<AppStore>()(
         tagFilterMode: state.tagFilterMode,
         mode: state.mode,
         mageDraft: state.mageDraft,
+        recentFolders: state.recentFolders,
       }),
-      // Fill draft fields added after the draft was persisted
+      // Fill settings and draft fields added after they were persisted
       merge: (persisted, current) => {
         const p = (persisted ?? {}) as Partial<AppStore>
-        return { ...current, ...p, mageDraft: { ...current.mageDraft, ...p.mageDraft } }
+        return {
+          ...current,
+          ...p,
+          settings: { ...current.settings, ...p.settings },
+          mageDraft: { ...current.mageDraft, ...p.mageDraft },
+        }
       },
     }
   )

@@ -42,8 +42,10 @@ export function Player() {
     setShowPlayer(false)
     if (currentVideo) {
       // Keep whatever selection the user had. Only when nothing was selected,
-      // select the played video as a convenience for follow-up actions.
-      if (useStore.getState().selectedVideoIds.size === 0) {
+      // select the played video as a convenience for follow-up actions
+      // (not after a quick mix, which should leave nothing selected).
+      const s = useStore.getState()
+      if (s.selectedVideoIds.size === 0 && s.selectPlayedOnClose) {
         toggleVideoSelection(currentVideo.id)
       }
       setScrollToVideoId(currentVideo.id)

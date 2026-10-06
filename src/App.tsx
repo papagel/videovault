@@ -8,6 +8,7 @@ import { Toolbar } from '@/components/Toolbar'
 import { VideoGrid } from '@/components/VideoGrid'
 import { Player } from '@/components/Player'
 import { MergeModal } from '@/components/MergeModal'
+import { IntroPicker } from '@/components/IntroPicker'
 import { TrimModal } from '@/components/TrimModal'
 import { TagModal } from '@/components/TagModal'
 import { SettingsModal } from '@/components/SettingsModal'
@@ -261,6 +262,24 @@ const AppWrapper = () => {
         if (s.showTagModal)         { s.setShowTagModal(false);      return }
         if (s.showMergeModal)       { s.setShowMergeModal(false);    return }
         if (s.showSettingsModal)    { s.setShowSettingsModal(false); return }
+        // Then the letter filter; the selection stays as it is
+        if (s.letterFilter && !isInput) { s.setLetterFilter(null); return }
+      }
+
+      // A letter or digit → show only names starting with it (Esc clears)
+      if (
+        inLibrary && !isInput && !playerModalOpen &&
+        !e.metaKey && !e.ctrlKey && !e.altKey &&
+        /^[\p{L}\p{N}]$/u.test(e.key)
+      ) {
+        const s = useStore.getState()
+        const modalOpen = s.quickPreviewVideo || s.contextMenuVideo || s.showTrimModal || s.showRenameModal ||
+          s.showTagModal || s.showMergeModal || s.showSettingsModal
+        if (!modalOpen) {
+          e.preventDefault()
+          s.setLetterFilter(e.key.toLowerCase())
+        }
+        return
       }
     }
     window.addEventListener('keydown', handler)
@@ -293,6 +312,7 @@ const AppWrapper = () => {
       <Player />
 
       <MergeModal />
+      <IntroPicker />
       <TagModal />
       <SettingsModal />
       <EntityModal />

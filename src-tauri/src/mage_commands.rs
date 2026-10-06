@@ -18,11 +18,15 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
-/// The API key, cached after the first Keychain read so the Keychain is not
-/// queried on every poll.
-pub struct MageKeyState(pub Mutex<Option<String>>);
+/// The API key, read from the Keychain at most once per launch: `None` until
+/// the first read, then that read's result. A failed or denied read is
+/// remembered too, so macOS doesn't ask again on every call; saving the key
+/// in Settings replaces it.
+pub struct MageKeyState(pub Mutex<Option<Option<String>>>);
 
 const OUTPUT_DIR_KEY: &str = "mage_output_dir";
+/// "0" when generated videos should stay out of the library
+const ADD_TO_LIBRARY_KEY: &str = "mage_add_to_library";
 const NO_KEY: &str = "No Mage API key. Add one in Settings → Mage.";
 
 fn now() -> String {
@@ -36,10 +40,11 @@ fn err(e: anyhow::Error) -> String {
 fn client(app: &AppHandle) -> Result<Client, String> {
     let state = app.state::<MageKeyState>();
     let mut cached = state.0.lock().map_err(|e| e.to_string())?;
-    if cached.is_none() {
-        *cached = mage::load_api_key();
-    }
-    cached.clone().map(Client::new).ok_or_else(|| NO_KEY.to_string())
+    cached
+        .get_or_insert_with(mage::load_api_key)
+        .clone()
+        .map(Client::new)
+        .ok_or_else(|| NO_KEY.to_string())
 }
 
 fn with_conn<T>(
@@ -61,11 +66,28 @@ fn output_dir(app: &AppHandle, conn: &Connection) -> String {
     })
 }
 
-/// Create the Mage folder and make sure it is part of the library, so
-/// generated videos show up next to everything else.
+fn adds_to_library(conn: &Connection) -> bool {
+    db::get_setting(conn, ADD_TO_LIBRARY_KEY).as_deref() != Some("0")
+}
+
+/// The Mage folder as a path prefix, when its videos are kept out of the
+/// library. Library scans and the folder watcher skip paths under it.
+pub fn library_exclusion(app: &AppHandle) -> Option<String> {
+    with_conn(app, |conn| {
+        Ok((!adds_to_library(conn)).then(|| format!("{}/", output_dir(app, conn).trim_end_matches('/'))))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Create the Mage folder and, when generated videos go to the library,
+/// make sure it is watched so they show up next to everything else.
 fn ensure_output_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let (dir, newly_watched) = with_conn(app, |conn| {
         let dir = output_dir(app, conn);
+        if !adds_to_library(conn) {
+            return Ok((dir, false));
+        }
         let watched: Vec<String> = conn
             .prepare("SELECT path FROM watched_folders")?
             .query_map([], |r| r.get(0))?
@@ -99,13 +121,30 @@ fn ensure_output_dir(app: &AppHandle) -> Result<PathBuf, String> {
 pub struct MageConfig {
     pub has_key: bool,
     pub output_dir: String,
+    pub add_to_library: bool,
 }
 
 #[tauri::command]
 pub async fn mage_get_config(app: AppHandle) -> Result<MageConfig, String> {
     let has_key = client(&app).is_ok();
-    let output_dir = with_conn(&app, |conn| Ok(output_dir(&app, conn)))?;
-    Ok(MageConfig { has_key, output_dir })
+    let (output_dir, add_to_library) =
+        with_conn(&app, |conn| Ok((output_dir(&app, conn), adds_to_library(conn))))?;
+    Ok(MageConfig { has_key, output_dir, add_to_library })
+}
+
+/// Whether new generated videos are indexed into the library. Turning it off
+/// leaves videos already there in place.
+#[tauri::command]
+pub async fn mage_set_add_to_library(enabled: bool, app: AppHandle) -> Result<(), String> {
+    {
+        let state = app.state::<DbState>();
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        db::set_setting(&conn, ADD_TO_LIBRARY_KEY, if enabled { "1" } else { "0" }).map_err(err)?;
+    }
+    if enabled {
+        ensure_output_dir(&app)?;
+    }
+    Ok(())
 }
 
 /// Validate the key against the API, then store it in the Keychain.
@@ -118,14 +157,16 @@ pub async fn mage_set_api_key(key: String, app: AppHandle) -> Result<f64, String
     }
     let balance = Client::new(key.clone()).balance().await.map_err(err)?;
     mage::store_api_key(&key).map_err(err)?;
-    *app.state::<MageKeyState>().0.lock().map_err(|e| e.to_string())? = Some(key);
+    *app.state::<MageKeyState>().0.lock().map_err(|e| e.to_string())? = Some(Some(key));
+    mage::reset_mcp_session().await;
     Ok(balance)
 }
 
 #[tauri::command]
 pub async fn mage_remove_api_key(app: AppHandle) -> Result<(), String> {
     mage::delete_api_key().map_err(err)?;
-    *app.state::<MageKeyState>().0.lock().map_err(|e| e.to_string())? = None;
+    *app.state::<MageKeyState>().0.lock().map_err(|e| e.to_string())? = Some(None);
+    mage::reset_mcp_session().await;
     Ok(())
 }
 
@@ -338,6 +379,23 @@ pub async fn mage_generate(args: GenerateArgs, app: AppHandle) -> Result<Generat
     load_generation(&app, &id)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EstimateArgs {
+    pub architecture: String,
+    /// The same config and inputs `mage_generate` takes
+    pub config: Map<String, Value>,
+    pub inputs: Value,
+}
+
+/// The exact price of a generation before submitting it. Inputs are uploaded
+/// first, since the price can depend on them; submitting reuses the uploads.
+#[tauri::command]
+pub async fn mage_estimate_cost(args: EstimateArgs, app: AppHandle) -> Result<mage::Estimate, String> {
+    let client = client(&app)?;
+    let config = resolve_inputs(&app, &client, Value::Object(args.config), &args.inputs).await?;
+    client.estimate_cost(&args.architecture, &config).await.map_err(err)
+}
+
 #[tauri::command]
 pub async fn mage_list_generations(app: AppHandle) -> Result<Vec<Generation>, String> {
     with_conn(&app, |conn| {
@@ -399,16 +457,36 @@ pub async fn mage_retry_generation(id: String, app: AppHandle) -> Result<(), Str
     Ok(())
 }
 
-/// Remove from history. The downloaded file stays on disk.
+/// Remove from history. With `trash_file`, the downloaded file also goes to
+/// the Trash (and leaves the library); otherwise it stays on disk.
 #[tauri::command]
-pub async fn mage_remove_generation(id: String, app: AppHandle) -> Result<(), String> {
-    with_conn(&app, |conn| {
+pub async fn mage_remove_generation(id: String, trash_file: Option<bool>, app: AppHandle) -> Result<(), String> {
+    let local: Option<String> = with_conn(&app, |conn| {
+        let path = conn
+            .query_row(
+                "SELECT local_path FROM mage_generations WHERE id = ?1
+                 AND status IN ('completed', 'failed', 'cancelled')",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
         conn.execute(
             "DELETE FROM mage_generations WHERE id = ?1
              AND status IN ('completed', 'failed', 'cancelled')",
             params![id],
-        )
+        )?;
+        Ok(path)
     })?;
+    if let (Some(path), true) = (local, trash_file.unwrap_or(false)) {
+        if Path::new(&path).exists() {
+            commands::move_to_trash(&path)?;
+        }
+        with_conn(&app, |conn| {
+            conn.execute("UPDATE videos SET is_deleted = 1 WHERE path = ?1", params![path])
+        })?;
+        let _ = app.emit("video-removed", commands::VideoRemoved { path });
+    }
     Ok(())
 }
 
@@ -559,7 +637,8 @@ async fn finish_download(app: &AppHandle, g: &Generation) -> Result<(), String> 
     std::fs::rename(&tmp, &final_path).map_err(|e| e.to_string())?;
     let path = final_path.to_string_lossy().to_string();
 
-    let video_id = if g.media_type == "video" { add_to_library(app, &path, &g.prompt) } else { None };
+    let to_library = g.media_type == "video" && with_conn(app, |conn| Ok(adds_to_library(conn)))?;
+    let video_id = if to_library { add_to_library(app, &path, &g.prompt) } else { None };
 
     with_conn(app, |conn| {
         conn.execute(
@@ -694,7 +773,29 @@ async fn resolve_input(app: &AppHandle, client: &Client, path: &str) -> Result<S
     if let Some(url) = reusable {
         return Ok(url);
     }
-    client.upload_file(Path::new(path)).await.map_err(err)
+    let key = upload_key(path);
+    if let Some(url) = key.as_ref().and_then(|k| upload_cache().lock().ok()?.get(k).cloned()) {
+        return Ok(url);
+    }
+    let url = client.upload_file(Path::new(path)).await.map_err(err)?;
+    if let (Some(k), Ok(mut cache)) = (key, upload_cache().lock()) {
+        cache.insert(k, url.clone());
+    }
+    Ok(url)
+}
+
+/// Files uploaded this session. Price quotes upload a request's inputs, and
+/// the generation then reuses those URLs (uploads stay valid for 30 days).
+fn upload_cache() -> &'static Mutex<std::collections::HashMap<String, String>> {
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Path plus size and modification time, so an edited file uploads again.
+fn upload_key(path: &str) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(format!("{}|{}|{:?}", path, meta.len(), meta.modified().ok()?))
 }
 
 // ── Characters & references ─────────────────────────────────────────────────
@@ -715,6 +816,19 @@ pub struct MageEntity {
     pub local_image_path: Option<String>,
     pub visibility: Option<String>,
     pub created_at: String,
+    /// Local intro video, if one is linked
+    pub intro: Option<MageIntro>,
+}
+
+/// A short video linked to a character or reference on this Mac only, used
+/// to open merges ("intro on top").
+#[derive(Debug, Serialize, Clone)]
+pub struct MageIntro {
+    pub path: String,
+    pub duration_secs: f64,
+    pub width: u32,
+    pub height: u32,
+    pub thumbnail_path: Option<String>,
 }
 
 fn entity_from_json(v: &Value, entity_type: &str) -> MageEntity {
@@ -731,7 +845,36 @@ fn entity_from_json(v: &Value, entity_type: &str) -> MageEntity {
         local_image_path: None,
         visibility: s("visibility"),
         created_at: s("created_at").unwrap_or_else(now),
+        intro: None,
     }
+}
+
+fn load_intro(conn: &Connection, entity_id: &str) -> rusqlite::Result<Option<MageIntro>> {
+    conn.query_row(
+        "SELECT path, duration_secs, width, height, thumbnail_path FROM mage_entity_intros WHERE entity_id = ?1",
+        params![entity_id],
+        |r| {
+            Ok(MageIntro {
+                path: r.get(0)?,
+                duration_secs: r.get(1)?,
+                width: r.get(2)?,
+                height: r.get(3)?,
+                thumbnail_path: r.get(4)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Remove an entity's intro link and its thumbnail (the video file stays).
+fn drop_intro(conn: &Connection, entity_id: &str) -> rusqlite::Result<()> {
+    if let Some(intro) = load_intro(conn, entity_id)? {
+        if let Some(t) = intro.thumbnail_path {
+            let _ = std::fs::remove_file(t);
+        }
+    }
+    conn.execute("DELETE FROM mage_entity_intros WHERE entity_id = ?1", params![entity_id])?;
+    Ok(())
 }
 
 fn collection_for(entity_type: &str) -> &'static str {
@@ -763,9 +906,11 @@ fn insert_entity(conn: &Connection, e: &MageEntity) -> rusqlite::Result<usize> {
 
 fn query_entities(conn: &Connection) -> rusqlite::Result<Vec<MageEntity>> {
     let mut stmt = conn.prepare(
-        "SELECT id, entity_type, handle, name, kind, description, image_url, audio_url,
-                local_image_path, visibility, created_at
-         FROM mage_entities ORDER BY entity_type, created_at DESC",
+        "SELECT e.id, e.entity_type, e.handle, e.name, e.kind, e.description, e.image_url, e.audio_url,
+                e.local_image_path, e.visibility, e.created_at,
+                i.path, i.duration_secs, i.width, i.height, i.thumbnail_path
+         FROM mage_entities e LEFT JOIN mage_entity_intros i ON i.entity_id = e.id
+         ORDER BY e.entity_type, e.created_at DESC",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -781,6 +926,16 @@ fn query_entities(conn: &Connection) -> rusqlite::Result<Vec<MageEntity>> {
                 local_image_path: r.get(8)?,
                 visibility: r.get(9)?,
                 created_at: r.get(10)?,
+                intro: match r.get::<_, Option<String>>(11)? {
+                    Some(path) => Some(MageIntro {
+                        path,
+                        duration_secs: r.get(12)?,
+                        width: r.get(13)?,
+                        height: r.get(14)?,
+                        thumbnail_path: r.get(15)?,
+                    }),
+                    None => None,
+                },
             })
         })?
         .filter_map(|r| r.ok())
@@ -847,6 +1002,15 @@ pub async fn mage_sync_entities(app: AppHandle) -> Result<Vec<MageEntity>, Strin
         conn.execute("DELETE FROM mage_entities", [])?;
         for e in &remote {
             insert_entity(conn, e)?;
+        }
+        // Intros of entities deleted elsewhere (e.g. in the Mage app)
+        let orphans: Vec<String> = conn
+            .prepare("SELECT entity_id FROM mage_entity_intros WHERE entity_id NOT IN (SELECT id FROM mage_entities)")?
+            .query_map([], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for id in orphans {
+            drop_intro(conn, &id)?;
         }
         query_entities(conn)
     })
@@ -939,12 +1103,234 @@ pub async fn mage_delete_entity(id: String, entity_type: String, app: AppHandle)
             .optional()?
             .flatten();
         conn.execute("DELETE FROM mage_entities WHERE id = ?1", params![id])?;
+        drop_intro(conn, &id)?;
         Ok(path)
     })?;
     if let Some(p) = local {
         let _ = std::fs::remove_file(p);
     }
     Ok(())
+}
+
+/// Link a local video as an entity's intro (replacing any earlier one).
+/// Stays on this Mac; nothing is sent to Mage.
+#[tauri::command]
+pub async fn mage_set_entity_intro(entity_id: String, path: String, app: AppHandle) -> Result<MageIntro, String> {
+    let meta = tokio::task::block_in_place(|| crate::ffmpeg::probe_video(&path))
+        .map_err(|e| format!("Could not read {}: {}", path, e))?;
+    // A fresh name each time, so the webview never shows a cached old frame
+    let thumb = entity_cache_dir(&app)?
+        .join(format!("intro_{}.jpg", Uuid::new_v4().simple()))
+        .to_string_lossy()
+        .to_string();
+    let thumbnail_path = tokio::task::block_in_place(|| {
+        crate::ffmpeg::extract_thumbnail(&path, &thumb, (meta.duration_secs * 0.1).min(1.0))
+    })
+    .ok()
+    .map(|_| thumb);
+    let intro = MageIntro {
+        path,
+        duration_secs: meta.duration_secs,
+        width: meta.width,
+        height: meta.height,
+        thumbnail_path,
+    };
+    with_conn(&app, |conn| {
+        drop_intro(conn, &entity_id)?;
+        conn.execute(
+            "INSERT INTO mage_entity_intros (entity_id, path, duration_secs, width, height, thumbnail_path, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![entity_id, intro.path, intro.duration_secs, intro.width, intro.height, intro.thumbnail_path, now()],
+        )
+    })?;
+    Ok(intro)
+}
+
+#[tauri::command]
+pub async fn mage_clear_entity_intro(entity_id: String, app: AppHandle) -> Result<(), String> {
+    with_conn(&app, |conn| drop_intro(conn, &entity_id))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateEntityArgs {
+    pub id: String,
+    pub name: String,
+    pub handle: String,
+    /// References only: object, location, pose, outfit or audio
+    pub kind: Option<String>,
+    pub description: Option<String>,
+    /// A new image (or audio clip); `None` keeps the current one
+    pub file_path: Option<String>,
+    /// Characters only: a new voice clip
+    pub voice_path: Option<String>,
+    /// Characters only: drop the current voice
+    #[serde(default)]
+    pub remove_voice: bool,
+}
+
+/// Copy media already on Mage into a fresh upload, so it survives deleting
+/// the entity it belongs to.
+async fn rehost(app: &AppHandle, client: &Client, url: &str, media_type: &str) -> Result<String, String> {
+    let dir = entity_cache_dir(app)?;
+    let tmp = dir.join(format!(".rehost-{}.part", Uuid::new_v4()));
+    let result = async {
+        let ct = mage::download(url, &tmp).await.map_err(err)?;
+        let dest = tmp.with_extension(mage::extension_for(ct.as_deref(), media_type));
+        std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+        let uploaded = client.upload_file(&dest).await.map_err(err);
+        let _ = std::fs::remove_file(&dest);
+        uploaded
+    }
+    .await;
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// The entity's current image or audio, as a URL that outlives it.
+async fn current_media(app: &AppHandle, client: &Client, e: &MageEntity) -> Result<String, String> {
+    if e.kind.as_deref() == Some("audio") {
+        let url = e.audio_url.as_deref().ok_or("This reference has no audio clip")?;
+        return rehost(app, client, url, "audio").await;
+    }
+    if let Some(p) = e.local_image_path.as_deref().filter(|p| Path::new(p).exists()) {
+        return resolve_input(app, client, p).await;
+    }
+    let url = e.image_url.as_deref().ok_or("This entry has no image")?;
+    rehost(app, client, url, "image").await
+}
+
+fn entity_body(
+    e_type: &str,
+    name: &str,
+    handle: &str,
+    kind: Option<&str>,
+    description: Option<&str>,
+    media: &str,
+    voice: Option<&str>,
+) -> Value {
+    let mut body = json!({ "name": name, "handle": handle });
+    if e_type == "reference" {
+        let kind = kind.unwrap_or("object");
+        body["kind"] = json!(kind);
+        body[if kind == "audio" { "audio" } else { "image" }] = json!(media);
+    } else {
+        body["image"] = json!(media);
+        if let Some(v) = voice {
+            body["voice"] = json!(v);
+        }
+    }
+    if let Some(d) = description {
+        body["description"] = json!(d);
+    }
+    body
+}
+
+/// Mage has no edit endpoint, so an edit saves a new character or reference
+/// with the changed fields (reusing the current media) and deletes the old
+/// one. Handles are unique: a new handle is created before the old entry is
+/// deleted; keeping the handle means deleting first, and if saving then
+/// fails the original is put back.
+#[tauri::command]
+pub async fn mage_update_entity(args: UpdateEntityArgs, app: AppHandle) -> Result<MageEntity, String> {
+    let client = client(&app)?;
+    let old = with_conn(&app, query_entities)?
+        .into_iter()
+        .find(|e| e.id == args.id)
+        .ok_or("This entry is no longer in your list. Sync and try again.")?;
+    let e_type = old.entity_type.clone();
+    let collection = collection_for(&e_type);
+    let name = args.name.trim().to_string();
+    let handle = args.handle.trim().to_lowercase();
+    let description = clean(args.description.clone());
+    let kind = if e_type == "reference" { args.kind.clone().or(old.kind.clone()) } else { None };
+    let was_audio = old.kind.as_deref() == Some("audio");
+    let is_audio = kind.as_deref() == Some("audio");
+    if name.is_empty() {
+        return Err("A name is required".into());
+    }
+    if args.file_path.is_none() && was_audio != is_audio {
+        return Err(if is_audio { "Choose an audio clip for an audio reference" } else { "Choose an image for this reference" }.into());
+    }
+
+    let old_media = if args.file_path.is_none() || handle == old.handle {
+        Some(current_media(&app, &client, &old).await?)
+    } else {
+        None
+    };
+    let media = match &args.file_path {
+        Some(p) => resolve_input(&app, &client, p).await?,
+        None => old_media.clone().unwrap_or_default(),
+    };
+    let old_voice = match (&old.audio_url, e_type.as_str()) {
+        (Some(url), "character") => Some(rehost(&app, &client, url, "audio").await?),
+        _ => None,
+    };
+    let voice = if e_type != "character" || args.remove_voice {
+        None
+    } else if let Some(v) = clean(args.voice_path.clone()) {
+        Some(client.upload_file(Path::new(&v)).await.map_err(err)?)
+    } else {
+        old_voice.clone()
+    };
+
+    let body = entity_body(
+        &e_type, &name, &handle, kind.as_deref(), description.as_deref(), &media, voice.as_deref(),
+    );
+    let delete_old = || async {
+        match client.delete_entity(collection, &old.id).await {
+            Err(e) if !e.downcast_ref::<ApiError>().map(|a| a.status == 404).unwrap_or(false) => Err(err(e)),
+            _ => Ok(()),
+        }
+    };
+
+    let created = if handle == old.handle {
+        delete_old().await?;
+        match client.create_entity(collection, &body).await {
+            Ok(v) => v,
+            Err(e) => {
+                let restore = entity_body(
+                    &e_type, &old.name, &old.handle, old.kind.as_deref(), old.description.as_deref(),
+                    old_media.as_deref().unwrap_or_default(), old_voice.as_deref(),
+                );
+                let restored = client.create_entity(collection, &restore).await;
+                let _ = mage_sync_entities(app.clone()).await;
+                return Err(match restored {
+                    Ok(_) => format!("Could not save the changes: {}. The original is unchanged.", err(e)),
+                    Err(_) => format!("Could not save the changes: {}. The original @{} was removed; create it again.", err(e), old.handle),
+                });
+            }
+        }
+    } else {
+        let v = client.create_entity(collection, &body).await.map_err(err)?;
+        if let Err(e) = delete_old().await {
+            log::warn!("Saved @{} but could not delete @{}: {}", handle, old.handle, e);
+        }
+        v
+    };
+
+    let mut entity = entity_from_json(&created, &e_type);
+    entity.local_image_path = match (&args.file_path, is_audio) {
+        (Some(p), false) => cache_source_image(&app, &entity.id, p),
+        (None, false) => old
+            .local_image_path
+            .as_deref()
+            .and_then(|p| cache_source_image(&app, &entity.id, p)),
+        _ => None,
+    };
+    if let Some(p) = &old.local_image_path {
+        let _ = std::fs::remove_file(p);
+    }
+    entity.intro = old.intro.clone();
+    with_conn(&app, |conn| {
+        conn.execute("DELETE FROM mage_entities WHERE id = ?1", params![old.id])?;
+        // The intro is local: it follows the entity to its new id
+        conn.execute(
+            "UPDATE mage_entity_intros SET entity_id = ?1 WHERE entity_id = ?2",
+            params![entity.id, old.id],
+        )?;
+        insert_entity(conn, &entity)
+    })?;
+    Ok(entity)
 }
 
 #[cfg(test)]

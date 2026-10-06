@@ -6,7 +6,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
@@ -285,6 +285,254 @@ impl Client {
         }
         Ok(ticket.url)
     }
+}
+
+// ── Price quotes (MCP) ──────────────────────────────────────────────────────
+//
+// The REST catalog prices only each model's default config, and the exact
+// charge otherwise shows up after submitting. Mage's MCP server has an
+// `estimate_cost` tool that prices any config without charging; it takes the
+// same API key as a Bearer token.
+
+pub const MCP_URL: &str = "https://mcp.mage.space/mcp";
+const MCP_PROTOCOL: &str = "2025-06-18";
+
+#[derive(Clone)]
+struct McpSession {
+    id: Option<String>,
+    /// `inputSchema` of `estimate_cost`, used to shape its arguments
+    estimate_schema: Value,
+}
+
+fn mcp_session() -> &'static tokio::sync::Mutex<Option<McpSession>> {
+    static SESSION: std::sync::OnceLock<tokio::sync::Mutex<Option<McpSession>>> =
+        std::sync::OnceLock::new();
+    SESSION.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
+/// Forget the MCP session, e.g. after the API key changes.
+pub async fn reset_mcp_session() {
+    *mcp_session().lock().await = None;
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Estimate {
+    /// The price in gems, when Mage quoted one
+    pub gems: Option<f64>,
+    /// Why Mage would refuse this request, when it would
+    pub refused: Option<String>,
+}
+
+impl Client {
+    /// One JSON-RPC call to the MCP server. Answers come back either as JSON
+    /// or as a short event stream; both are handled.
+    async fn mcp_post(&self, session: Option<&str>, body: &Value) -> Result<(Option<String>, Value)> {
+        let mut req = self
+            .http
+            .post(MCP_URL)
+            .bearer_auth(&self.key)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", MCP_PROTOCOL)
+            .timeout(std::time::Duration::from_secs(60))
+            .json(body);
+        if let Some(s) = session {
+            req = req.header("Mcp-Session-Id", s);
+        }
+        let resp = req.send().await.context("Could not reach Mage")?;
+        let status = resp.status().as_u16();
+        let sid = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let is_sse = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.contains("event-stream"))
+            .unwrap_or(false);
+        let text = resp.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Err(ApiError {
+                status,
+                code: "mcp_error".into(),
+                message: format!("Mage price check failed (HTTP {})", status),
+            }
+            .into());
+        }
+        let Some(id) = body.get("id") else {
+            return Ok((sid, Value::Null)); // a notification: nothing comes back
+        };
+        let msg: Value = if is_sse {
+            text.lines()
+                .filter_map(|l| l.strip_prefix("data:"))
+                .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
+                .find(|m| m.get("id") == Some(id))
+                .ok_or_else(|| anyhow!("Empty answer from Mage's price check"))?
+        } else {
+            serde_json::from_str(&text).context("Unexpected answer from Mage's price check")?
+        };
+        if let Some(e) = msg.get("error") {
+            return Err(anyhow!(
+                "Mage price check failed: {}",
+                e["message"].as_str().unwrap_or("unknown error")
+            ));
+        }
+        Ok((sid, msg["result"].clone()))
+    }
+
+    async fn open_mcp_session(&self) -> Result<McpSession> {
+        let (sid, _) = self
+            .mcp_post(
+                None,
+                &json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": MCP_PROTOCOL,
+                        "capabilities": {},
+                        "clientInfo": { "name": "VideoVault", "version": env!("CARGO_PKG_VERSION") },
+                    },
+                }),
+            )
+            .await?;
+        let sid_ref = sid.as_deref();
+        self.mcp_post(sid_ref, &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+            .await?;
+        let (_, tools) = self
+            .mcp_post(sid_ref, &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
+            .await?;
+        let estimate_schema = tools["tools"]
+            .as_array()
+            .and_then(|list| list.iter().find(|t| t["name"] == "estimate_cost"))
+            .map(|t| t["inputSchema"].clone())
+            .ok_or_else(|| anyhow!("Mage's price check is not available"))?;
+        log::info!("Mage estimate_cost schema: {}", estimate_schema);
+        Ok(McpSession { id: sid, estimate_schema })
+    }
+
+    /// The exact gem price of a generation, without charging anything.
+    /// `config` is the full request body, media fields already as URLs.
+    pub async fn estimate_cost(&self, architecture: &str, config: &Value) -> Result<Estimate> {
+        for attempt in 0..2 {
+            let session = {
+                let mut guard = mcp_session().lock().await;
+                match guard.as_ref() {
+                    Some(s) => s.clone(),
+                    None => {
+                        let s = self.open_mcp_session().await?;
+                        *guard = Some(s.clone());
+                        s
+                    }
+                }
+            };
+            let args = estimate_args(&session.estimate_schema, architecture, config);
+            let body = json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": { "name": "estimate_cost", "arguments": args },
+            });
+            match self.mcp_post(session.id.as_deref(), &body).await {
+                Ok((_, result)) => {
+                    log::debug!("Mage estimate_cost result: {}", result);
+                    return Ok(parse_estimate(&result));
+                }
+                // An expired session answers 404 (or 400): open a new one once.
+                Err(e) if attempt == 0
+                    && e.downcast_ref::<ApiError>().map(|a| a.status == 404 || a.status == 400).unwrap_or(false) =>
+                {
+                    reset_mcp_session().await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
+    }
+}
+
+/// Shape the tool arguments after its schema: `{architecture, config}` as
+/// Mage's skills describe it, adapting to other names if the schema uses them.
+fn estimate_args(schema: &Value, architecture: &str, config: &Value) -> Value {
+    let props = schema["properties"].as_object();
+    let has = |k: &str| props.map(|p| p.contains_key(k)).unwrap_or(false);
+    let arch_key = ["architecture", "architecture_id", "model"]
+        .into_iter()
+        .find(|k| has(k))
+        .unwrap_or("architecture");
+    let mut args = Map::new();
+    args.insert(arch_key.to_string(), json!(architecture));
+    match ["config", "input", "inputs", "params", "parameters"].into_iter().find(|k| has(k)) {
+        Some(k) => {
+            args.insert(k.to_string(), config.clone());
+        }
+        // A flat schema takes the config fields at the top level
+        None if props.is_some() => {
+            if let Some(fields) = config.as_object() {
+                for (k, v) in fields {
+                    args.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+        None => {
+            args.insert("config".to_string(), config.clone());
+        }
+    }
+    Value::Object(args)
+}
+
+fn parse_estimate(result: &Value) -> Estimate {
+    let text: String = result["content"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    if result["isError"].as_bool().unwrap_or(false) {
+        let msg = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v["error"]["message"].as_str().or(v["message"].as_str()).map(str::to_string)
+            })
+            .unwrap_or_else(|| text.trim().to_string());
+        return Estimate { gems: None, refused: Some(msg) };
+    }
+    let gems = find_gems(&result["structuredContent"])
+        .or_else(|| serde_json::from_str::<Value>(&text).ok().and_then(|v| find_gems(&v)))
+        .or_else(|| gems_in_text(&text));
+    Estimate { gems, refused: None }
+}
+
+/// The price in a JSON answer: the first price-like key, searched breadth-first.
+fn find_gems(v: &Value) -> Option<f64> {
+    const KEYS: [&str; 9] = [
+        "gems", "total_gems", "gems_total", "estimated_gems", "gems_required",
+        "gems_charged", "price", "cost", "total",
+    ];
+    let as_num = |v: &Value| v.as_f64().or_else(|| v.as_str().and_then(|s| s.replace(',', "").parse().ok()));
+    let obj = v.as_object()?;
+    for k in KEYS {
+        if let Some(n) = obj.get(k).and_then(as_num) {
+            return Some(n);
+        }
+    }
+    obj.values().filter(|c| c.is_object()).find_map(find_gems)
+}
+
+/// "This costs 245 gems" → 245.
+fn gems_in_text(text: &str) -> Option<f64> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    words.windows(2).find_map(|w| {
+        let unit = w[1].trim_matches(|c: char| !c.is_alphabetic()).to_lowercase();
+        if unit != "gems" && unit != "gem" {
+            return None;
+        }
+        w[0].trim_matches(|c: char| !c.is_ascii_digit() && c != '.')
+            .replace(',', "")
+            .parse()
+            .ok()
+    })
 }
 
 /// Stream a URL to `dest`. Returns the response's content type, which decides

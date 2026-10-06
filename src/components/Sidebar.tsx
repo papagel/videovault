@@ -15,7 +15,10 @@ export function Sidebar() {
   const {
     sidebarOpen,
     sidebarWidth,
-    activeFolder,
+    activeFolders,
+    toggleActiveFolder,
+    setActiveFolders,
+    setLetterFilter,
     activeTags,
     tagFilterMode,
     activeCollection,
@@ -42,7 +45,10 @@ export function Sidebar() {
     useShallow((s) => ({
       sidebarOpen: s.sidebarOpen,
       sidebarWidth: s.sidebarWidth,
-      activeFolder: s.activeFolder,
+      activeFolders: s.activeFolders,
+      toggleActiveFolder: s.toggleActiveFolder,
+      setActiveFolders: s.setActiveFolders,
+      setLetterFilter: s.setLetterFilter,
       activeTags: s.activeTags,
       tagFilterMode: s.tagFilterMode,
       activeCollection: s.activeCollection,
@@ -105,7 +111,7 @@ export function Sidebar() {
     }
     setWatchedFolders(watchedFolders.filter((f) => f !== folder))
     setVideos(videos.filter((v) => v.folder !== folder && !v.folder.startsWith(folder + '/')))
-    if (activeFolder === folder || activeFolder?.startsWith(folder + '/')) setActiveFolder(null)
+    setActiveFolders(activeFolders.filter((f) => f !== folder && !f.startsWith(folder + '/')))
   }
 
   const handleStartCreateCollection = () => {
@@ -180,7 +186,25 @@ export function Sidebar() {
     return n
   }
 
-  const isFiltering = !!(activeFolder || activeCollection || activeTags.length || searchQuery)
+  const isFiltering = !!(activeFolders.length || activeCollection || activeTags.length || searchQuery)
+
+  /**
+   * Plain click shows just this folder (again to show all); ⌘/Ctrl/Shift-click
+   * adds it to the folders shown, or takes it out.
+   */
+  const clickFolder = (folder: string, e: React.MouseEvent) => {
+    setActiveTags([])
+    if (e.metaKey || e.ctrlKey || e.shiftKey) {
+      toggleActiveFolder(folder)
+      return
+    }
+    const onlyThis = activeFolders.length === 1 && activeFolders[0] === folder
+    setActiveFolder(onlyThis ? null : folder)
+  }
+  const folderTitle = (folder: string) =>
+    activeFolders.includes(folder)
+      ? activeFolders.length > 1 ? '⌘-click to stop showing this folder' : undefined
+      : activeFolders.length > 0 ? '⌘-click to show it together with the selected folders' : undefined
 
   // ── Resize handle ────────────────────────────────────────────────────────
   const handleResizeStart = useCallback((e: React.PointerEvent) => {
@@ -234,7 +258,7 @@ export function Sidebar() {
 
         {/* All Videos */}
         <button
-          onClick={() => { setActiveFolder(null); setActiveCollection(null); setActiveTags([]); setSearchQuery('') }}
+          onClick={() => { setActiveFolder(null); setActiveCollection(null); setActiveTags([]); setSearchQuery(''); setLetterFilter(null) }}
           className={cn(
             'w-full flex items-center gap-2.5 px-3 py-2 text-xs font-medium transition-all',
             !isFiltering
@@ -263,10 +287,11 @@ export function Sidebar() {
             return (
               <div key={root}>
                 <div
-                  onClick={() => { setActiveTags([]); setActiveFolder(activeFolder === root ? null : root) }}
+                  onClick={(e) => clickFolder(root, e)}
+                  title={folderTitle(root)}
                   className={cn(
                     'group/folder flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer transition-all',
-                    activeFolder === root
+                    activeFolders.includes(root)
                       ? 'text-[#6366f1] bg-[#6366f1]/10'
                       : 'text-[#8888aa] hover:text-white hover:bg-[#1e1e2a]'
                   )}
@@ -316,10 +341,11 @@ export function Sidebar() {
                   return (
                     <div
                       key={sub}
-                      onClick={() => { setActiveTags([]); setActiveFolder(activeFolder === sub ? null : sub) }}
+                      onClick={(e) => clickFolder(sub, e)}
+                      title={folderTitle(sub)}
                       className={cn(
                         'flex items-center gap-1.5 py-1 pr-3 text-xs cursor-pointer transition-all',
-                        activeFolder === sub
+                        activeFolders.includes(sub)
                           ? 'text-[#6366f1] bg-[#6366f1]/10'
                           : 'text-[#55556a] hover:text-[#8888aa] hover:bg-[#1e1e2a]'
                       )}
@@ -337,6 +363,15 @@ export function Sidebar() {
           })}
           {rootFolders.length === 0 && (
             <p className="px-3 py-1.5 text-[11px] text-[#55556a]">No folders — click + to add one</p>
+          )}
+          {activeFolders.length === 1 && rootFolders.length > 0 && (
+            <p className="px-3 pt-1 text-[10px] text-[#3a3a5a]">⌘-click another folder to show both</p>
+          )}
+          {activeFolders.length > 1 && (
+            <div className="flex items-center justify-between px-3 pt-1 text-[10px] text-[#55556a]">
+              <span>Showing {activeFolders.length} folders</span>
+              <button onClick={() => setActiveFolder(null)} className="text-[#6366f1] hover:text-[#7c7ff5]">Clear</button>
+            </div>
           )}
         </Section>
 

@@ -37,7 +37,19 @@ export interface AppSettings {
   gridSize: 'sm' | 'md' | 'lg'
   defaultView: 'grid' | 'list'
   volume: number
+  /** Ask before a Mage generation costs at least this many gems */
+  mageConfirmGems: number
+  /** Thumbnail size in the Create gallery */
+  mageThumbSize: MageThumbSize
+  /** Crop thumbnails to squares, or show the whole frame */
+  mageThumbFit: 'cover' | 'contain'
+  /** Removing a generation from history also moves its file to the Trash */
+  mageTrashOnRemove: boolean
+  /** Merge output: close to the source, or smaller files */
+  mergeQuality: 'high' | 'small'
 }
+
+export type MageThumbSize = 'xs' | 'sm' | 'md' | 'lg' | 'xl'
 
 export type SortField = 'filename' | 'duration_secs' | 'size_bytes' | 'modified_at' | 'play_count'
 export type SortDir = 'asc' | 'desc'
@@ -141,9 +153,38 @@ export interface MageEntity {
   local_image_path: string | null
   visibility: 'public' | 'private' | null
   created_at: string
+  /** Local intro video (this Mac only), for "merge with intro" */
+  intro: MageIntro | null
+}
+
+export interface MageIntro {
+  path: string
+  duration_secs: number
+  width: number
+  height: number
+  thumbnail_path: string | null
+}
+
+/** Opens the Merge dialog with fixed clips, e.g. a character's intro + a video */
+export interface MergePreset {
+  clips: VideoFile[]
+  /** Keep the given order: the first clip is the intro (gives its opening) */
+  introFirst: boolean
+  /** Where the merge is saved */
+  outputFolder: string
+  title: string
+}
+
+/** `mage_estimate_cost`: Mage's quote for an exact request, charging nothing. */
+export interface MageCostEstimate {
+  gems: number | null
+  /** Why Mage would refuse the request as configured */
+  refused: string | null
 }
 
 export interface MageConfig {
   has_key: boolean
   output_dir: string
+  /** Index generated videos into the library */
+  add_to_library: boolean
 }

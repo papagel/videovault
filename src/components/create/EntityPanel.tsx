@@ -1,16 +1,20 @@
 import { useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { Plus, RefreshCw, Trash2, User, Shapes, Music } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, User, Shapes, Music, Pencil, Check, Film } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '@/store'
 import { showConfirm } from '@/lib/dialog'
 import { cn, getThumbnailSrc } from '@/lib/utils'
-import { defaultModelId, mentionSupport, variantsOf } from '@/lib/mage'
+import { defaultModelId, mentionedHandles, mentionSupport, removeMention, variantsOf } from '@/lib/mage'
+import { SearchBox } from './GenerationGallery'
 import type { MageEntity } from '@/types'
 
-/** Saved Mage characters and references; clicking one adds its @handle to the prompt. */
+/**
+ * Saved Mage characters and references. Clicking one adds its @handle to the
+ * prompt; clicking a selected one (checked) takes it out again.
+ */
 export function EntityPanel() {
-  const { entities, setEntities, removeEntity, setEntityModal, architecture, modelId, architectures, updateDraft } =
+  const { entities, setEntities, removeEntity, setEntityModal, architecture, modelId, architectures, updateDraft, prompt } =
     useStore(
       useShallow((s) => ({
         entities: s.mageEntities,
@@ -21,9 +25,12 @@ export function EntityPanel() {
         modelId: s.mageDraft.config.model_id,
         architectures: s.mageArchitectures,
         updateDraft: s.updateMageDraft,
+        prompt: s.mageDraft.prompt,
       }))
     )
+  const selected = useMemo(() => new Set(mentionedHandles(prompt)), [prompt])
   const [tab, setTab] = useState<'character' | 'reference'>('character')
+  const [query, setQuery] = useState('')
   const [syncing, setSyncing] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -31,7 +38,14 @@ export function EntityPanel() {
   const variant = arch && typeof modelId === 'string' && variantsOf(arch).includes(modelId) ? modelId : arch && defaultModelId(arch)
   const support = mentionSupport(arch, variant)
 
-  const list = useMemo(() => entities.filter((e) => e.entity_type === tab), [entities, tab])
+  const list = useMemo(() => {
+    const words = query.toLowerCase().replace(/@/g, '').split(/\s+/).filter(Boolean)
+    return entities.filter((e) => {
+      if (e.entity_type !== tab) return false
+      const text = [e.name, e.handle, e.kind, e.description].filter(Boolean).join(' ').toLowerCase()
+      return words.every((w) => text.includes(w))
+    })
+  }, [entities, tab, query])
   const counts = useMemo(
     () => ({
       character: entities.filter((e) => e.entity_type === 'character').length,
@@ -55,10 +69,19 @@ export function EntityPanel() {
     }
   }
 
-  const insert = (e: MageEntity) => {
+  const toggle = (e: MageEntity) => {
     const prompt = useStore.getState().mageDraft.prompt
+    if (selected.has(e.handle.toLowerCase())) {
+      updateDraft({ prompt: removeMention(prompt, e.handle) })
+      return
+    }
     const sep = prompt && !/\s$/.test(prompt) ? ' ' : ''
     updateDraft({ prompt: `${prompt}${sep}@${e.handle} ` })
+  }
+
+  const edit = (e: MageEntity, ev: React.MouseEvent) => {
+    ev.stopPropagation()
+    setEntityModal({ type: e.entity_type, entity: e })
   }
 
   const remove = async (e: MageEntity, ev: React.MouseEvent) => {
@@ -102,6 +125,16 @@ export function EntityPanel() {
         </button>
       </div>
 
+      {counts[tab] > 0 && (
+        <div className="px-3 py-2 border-b border-[#1e1e2a]">
+          <SearchBox
+            value={query}
+            onChange={setQuery}
+            placeholder={tab === 'character' ? 'Search characters' : 'Search references'}
+          />
+        </div>
+      )}
+
       {arch && !(tab === 'character' ? support.characters : support.references || support.audio) && (
         <p className="px-3 py-2 text-[10px] text-amber-400/90 border-b border-[#1e1e2a]">
           {arch.name}{variant && variant !== arch.id ? ` (${variant})` : ''} doesn’t take {tab === 'character' ? 'characters' : 'references'}.
@@ -110,24 +143,44 @@ export function EntityPanel() {
       {error && <p className="px-3 py-2 text-[10px] text-red-400 break-words border-b border-[#1e1e2a]">{error}</p>}
 
       <div className="flex-1 overflow-y-auto py-1">
-        {list.length === 0 ? (
+        {list.length === 0 && query ? (
+          <p className="px-4 py-6 text-center text-[11px] text-[#55556a]">
+            No {tab === 'character' ? 'characters' : 'references'} match “{query}”.{' '}
+            <button onClick={() => setQuery('')} className="text-[#6366f1] hover:text-[#7c7ff5]">Clear</button>
+          </p>
+        ) : list.length === 0 ? (
           <p className="px-4 py-6 text-center text-[11px] text-[#55556a]">
             {tab === 'character'
               ? 'A character is a face you can reuse across images and videos. Create one from a portrait, then mention it as @handle.'
               : 'A reference is an object, location, pose, outfit or audio clip you can mention as @handle.'}
           </p>
         ) : (
-          list.map((e) => (
+          list.map((e) => {
+            const isSelected = selected.has(e.handle.toLowerCase())
+            return (
             <div
               key={e.id}
-              onClick={() => insert(e)}
-              title={supported(e) ? `Add @${e.handle} to the prompt` : `The selected model doesn't take this; add @${e.handle} anyway`}
+              onClick={() => toggle(e)}
+              title={
+                isSelected ? `In the prompt. Click to remove @${e.handle}`
+                : supported(e) ? `Add @${e.handle} to the prompt`
+                : `The selected model doesn't take this; add @${e.handle} anyway`
+              }
               className={cn(
-                'group flex items-center gap-2.5 px-3 py-1.5 cursor-pointer hover:bg-[#1e1e2a] transition-all',
-                !supported(e) && 'opacity-45'
+                'group flex items-center gap-2.5 px-3 py-1.5 cursor-pointer transition-all',
+                isSelected ? 'bg-[#6366f1]/10 hover:bg-[#6366f1]/15' : 'hover:bg-[#1e1e2a]',
+                !supported(e) && !isSelected && 'opacity-45'
               )}
             >
-              <div className="w-9 h-9 rounded-md bg-[#16161f] border border-[#2a2a3a] overflow-hidden flex-shrink-0 flex items-center justify-center text-[#55556a]">
+              <div className={cn(
+                'relative w-9 h-9 rounded-md bg-[#16161f] border overflow-hidden flex-shrink-0 flex items-center justify-center text-[#55556a]',
+                isSelected ? 'border-[#6366f1]' : 'border-[#2a2a3a]'
+              )}>
+                {isSelected && (
+                  <span className="absolute top-0 right-0 z-10 w-3.5 h-3.5 rounded-bl-md bg-[#6366f1] text-white flex items-center justify-center">
+                    <Check size={9} strokeWidth={3} />
+                  </span>
+                )}
                 {e.local_image_path || e.image_url ? (
                   <img
                     src={e.local_image_path ? getThumbnailSrc(e.local_image_path) : e.image_url!}
@@ -143,8 +196,20 @@ export function EntityPanel() {
                   @{e.handle}
                   {e.kind && <span className="text-[#55556a]"> · {e.kind}</span>}
                   {e.entity_type === 'character' && e.audio_url && <span className="text-[#55556a]"> · voice</span>}
+                  {e.intro && (
+                    <span className="text-[#55556a]" title={`Intro: ${e.intro.path}`}>
+                      {' · '}<Film size={9} className="inline -mt-px" /> intro
+                    </span>
+                  )}
                 </p>
               </div>
+              <button
+                onClick={(ev) => edit(e, ev)}
+                className="hidden group-hover:flex p-1 text-[#55556a] hover:text-[#6366f1]"
+                title="Edit or rename"
+              >
+                <Pencil size={12} />
+              </button>
               <button
                 onClick={(ev) => remove(e, ev)}
                 className="hidden group-hover:flex p-1 text-[#55556a] hover:text-red-400"
@@ -153,7 +218,8 @@ export function EntityPanel() {
                 <Trash2 size={12} />
               </button>
             </div>
-          ))
+            )
+          })
         )}
       </div>
     </div>

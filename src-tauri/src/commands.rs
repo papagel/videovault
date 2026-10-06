@@ -100,11 +100,13 @@ pub async fn scan_folder(
     let thumb_dir_path = thumb_dir.0.clone();
     std::fs::create_dir_all(&thumb_dir_path).map_err(|e| e.to_string())?;
 
+    let excluded = crate::mage_commands::library_exclusion(&app);
     let video_files: Vec<_> = WalkDir::new(&folder_path)
         .follow_links(true)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file() && is_video_file(e.path()))
+        .filter(|e| !excluded.as_ref().is_some_and(|dir| e.path().to_string_lossy().starts_with(dir.as_str())))
         .collect();
 
     let total = video_files.len();
@@ -134,14 +136,28 @@ pub async fn scan_folder(
 
         let conn = db.0.lock().map_err(|e| e.to_string())?;
 
-        // Check if already indexed
-        let existing: Option<String> = conn
+        // Check if already indexed. A soft-deleted row comes back when it's
+        // the same file; a different file that reused the name replaces it.
+        let mut existing: Option<String> = conn
             .query_row(
                 "SELECT id FROM videos WHERE path = ?1 AND is_deleted = 0",
                 params![path],
                 |row| row.get(0),
             )
             .ok();
+        if existing.is_none() {
+            let deleted: Option<String> = conn
+                .query_row("SELECT id FROM videos WHERE path = ?1 AND is_deleted = 1", params![path], |r| r.get(0))
+                .ok();
+            if let Some(old) = deleted {
+                if is_same_file_as_row(&conn, &old, &path) {
+                    let _ = conn.execute("UPDATE videos SET is_deleted = 0 WHERE id = ?1", params![old]);
+                    existing = Some(old);
+                } else {
+                    forget_video_row(&conn, &old);
+                }
+            }
+        }
 
         if let Some(id) = existing {
             drop(conn);
@@ -292,10 +308,48 @@ fn get_tags_for_video(conn: &Connection, video_id: &str) -> Result<Vec<Tag>> {
 /// Probe and index a single video file into the DB.
 /// Returns `None` if the file is already indexed or an error occurs.
 /// Must be called inside `tokio::task::block_in_place` from an async context.
+/// `modified_at` as stored for a file on disk.
+fn file_modified_at(path: &str) -> Option<String> {
+    let t = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(chrono::DateTime::<chrono::Utc>::from(t).format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+/// Whether the file now at a soft-deleted row's path is that same file
+/// (restored from the Trash keeps its size and modification time), rather
+/// than a different video that reused the name.
+fn is_same_file_as_row(conn: &rusqlite::Connection, id: &str, path: &str) -> bool {
+    let row: Option<(i64, Option<String>)> = conn
+        .query_row(
+            "SELECT size_bytes, modified_at FROM videos WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let size = std::fs::metadata(path).map(|m| m.len() as i64).ok();
+    matches!((row, size), (Some((s, m)), Some(now)) if s == now && m == file_modified_at(path))
+}
+
+/// Forget a video row entirely (tags, collections, thumbnail), so a new file
+/// with its old name is indexed from scratch.
+fn forget_video_row(conn: &rusqlite::Connection, id: &str) {
+    let thumb: Option<String> = conn
+        .query_row("SELECT thumbnail_path FROM videos WHERE id = ?1", params![id], |r| r.get(0))
+        .ok()
+        .flatten();
+    let _ = conn.execute("DELETE FROM video_tags WHERE video_id = ?1", params![id]);
+    let _ = conn.execute("DELETE FROM collection_videos WHERE video_id = ?1", params![id]);
+    let _ = conn.execute("UPDATE mage_generations SET video_id = NULL WHERE video_id = ?1", params![id]);
+    let _ = conn.execute("DELETE FROM videos WHERE id = ?1", params![id]);
+    if let Some(t) = thumb {
+        let _ = std::fs::remove_file(t);
+    }
+}
+
 pub(crate) fn index_single_video(db: &DbState, path: &str, thumb_dir: &str) -> Option<VideoFile> {
     // Check if already indexed (brief lock). A soft-deleted row for the same
-    // path is resurrected instead of inserting (path is UNIQUE, so INSERT OR
-    // IGNORE would silently no-op and we'd emit a phantom entry).
+    // path is resurrected when it's the same file (undo delete, restore from
+    // Trash). A different file that reused the name replaces the old row, so
+    // it gets its own thumbnail and metadata.
     {
         let conn = db.0.lock().ok()?;
         let existing: Option<(String, i64)> = conn
@@ -309,6 +363,9 @@ pub(crate) fn index_single_video(db: &DbState, path: &str, thumb_dir: &str) -> O
             if is_deleted == 0 {
                 return None;
             }
+            if !is_same_file_as_row(&conn, &id, path) {
+                forget_video_row(&conn, &id);
+            } else {
             conn.execute(
                 "UPDATE videos SET is_deleted = 0 WHERE id = ?1",
                 params![id],
@@ -316,6 +373,7 @@ pub(crate) fn index_single_video(db: &DbState, path: &str, thumb_dir: &str) -> O
             .ok()?;
             drop(conn);
             return get_video_by_id_internal(db, &id).ok();
+            }
         }
     }
 
@@ -493,9 +551,12 @@ pub async fn scan_folder_background(
             }
         }
 
+        // Videos in the Mage folder stay out when that setting is off
+        let excluded = crate::mage_commands::library_exclusion(&app);
         let new_files: Vec<(String, String)> = disk_files
             .into_iter()
             .filter(|(p, _)| !known_paths.contains(p))
+            .filter(|(p, _)| !excluded.as_ref().is_some_and(|dir| p.starts_with(dir.as_str())))
             .collect();
 
         let total = new_files.len();
@@ -593,6 +654,9 @@ pub async fn handle_fs_event(app: tauri::AppHandle, event: notify::Event) {
                     continue;
                 }
                 let path_str = path.to_string_lossy().to_string();
+                if crate::mage_commands::library_exclusion(&app).is_some_and(|dir| path_str.starts_with(&dir)) {
+                    continue;
+                }
                 // Brief pause so the OS finishes writing the file before we probe it
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -1095,15 +1159,29 @@ pub async fn remove_tags_from_videos(
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MergeClip {
     pub video_id: String,
+    /// A file outside the library (e.g. a character's intro); used instead
+    /// of looking `video_id` up
+    #[serde(default)]
+    pub path: Option<String>,
     /// Seconds to cut from the beginning of this clip before merging
     pub start_offset_secs: f64,
+    /// Seconds to keep after the offset; `None` keeps the rest of the clip
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MergeRequest {
     pub clips: Vec<MergeClip>,
-    pub output_filename: String,
+    /// `None` picks the first free `video_merge_NN.mp4` in the output folder
+    #[serde(default)]
+    pub output_filename: Option<String>,
     pub output_folder: String,
+    /// Cap on the merged length, so a fixed-length mix comes out exact
+    #[serde(default)]
+    pub total_duration_secs: Option<f64>,
+    #[serde(default)]
+    pub quality: ffmpeg::MergeQuality,
 }
 
 #[tauri::command]
@@ -1116,30 +1194,57 @@ pub async fn merge_videos(
 
     let mut inputs = Vec::new();
     for clip in &request.clips {
-        let path: String = conn
-            .query_row(
-                "SELECT path FROM videos WHERE id = ?1",
-                params![clip.video_id],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
+        let path: String = match &clip.path {
+            Some(p) => p.clone(),
+            None => conn
+                .query_row(
+                    "SELECT path FROM videos WHERE id = ?1",
+                    params![clip.video_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?,
+        };
         inputs.push(ffmpeg::MergeInput {
             path,
             start_offset_secs: clip.start_offset_secs.max(0.0),
+            duration_secs: clip.duration_secs.filter(|d| *d > 0.0),
         });
     }
     drop(conn);
 
-    let output_path = format!("{}/{}", request.output_folder, request.output_filename);
+    let filename = match request.output_filename.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        Some(f) => f.to_string(),
+        None => next_merge_name(Path::new(&request.output_folder)),
+    };
+    let output_path = format!("{}/{}", request.output_folder.trim_end_matches('/'), filename);
     let app_clone = app.clone();
 
     tokio::task::block_in_place(|| {
-        ffmpeg::merge_videos(&inputs, &output_path, |progress| {
+        ffmpeg::merge_videos(&inputs, &output_path, request.total_duration_secs, request.quality, |progress| {
             let _ = app_clone.emit("merge-progress", progress);
         })
         .map_err(|e| e.to_string())
         .map(|_| output_path)
     })
+}
+
+/// The lowest-numbered `video_merge_NN.mp4` not used in `folder` (any
+/// extension counts as used), so gaps left by deleted files are filled first
+/// and merges read as one numbered list.
+fn next_merge_name(folder: &Path) -> String {
+    let taken: std::collections::HashSet<String> = std::fs::read_dir(folder)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.path().file_stem()?.to_str().map(str::to_lowercase))
+                .collect()
+        })
+        .unwrap_or_default();
+    let stem = (1u32..)
+        .map(|n| format!("video_merge_{:02}", n))
+        .find(|s| !taken.contains(s))
+        .unwrap_or_else(|| "video_merge".into());
+    format!("{}.mp4", stem)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1148,6 +1253,12 @@ pub struct TrimRequest {
     pub output_filename: String,
     pub output_folder: String,
     pub segments: Vec<ffmpeg::TrimSegment>,
+    /// Play the kept footage this many times faster
+    #[serde(default)]
+    pub speed: Option<f64>,
+    /// Cut the output to this length (fit-to-length trims)
+    #[serde(default)]
+    pub max_duration: Option<f64>,
 }
 
 #[tauri::command]
@@ -1168,7 +1279,7 @@ pub async fn trim_video(
     let output_path = format!("{}/{}", request.output_folder, request.output_filename);
     let segments = request.segments;
     tokio::task::block_in_place(|| {
-        ffmpeg::trim_video(&path, &output_path, &segments)
+        ffmpeg::trim_video(&path, &output_path, &segments, request.speed, request.max_duration)
             .map_err(|e| e.to_string())
             .map(|_| output_path)
     })
@@ -1182,6 +1293,8 @@ pub async fn trim_video(
 pub async fn trim_replace_video(
     video_id: String,
     segments: Vec<ffmpeg::TrimSegment>,
+    speed: Option<f64>,
+    max_duration: Option<f64>,
     db: State<'_, DbState>,
     thumb_dir: State<'_, ThumbDirState>,
 ) -> Result<VideoFile, String> {
@@ -1208,7 +1321,7 @@ pub async fn trim_replace_video(
         let p = path.clone();
         let t = temp_out.clone();
         let segs = segments.clone();
-        tokio::task::block_in_place(move || ffmpeg::trim_video(&p, &t, &segs))
+        tokio::task::block_in_place(move || ffmpeg::trim_video(&p, &t, &segs, speed, max_duration))
     };
     if let Err(e) = render {
         let _ = std::fs::remove_file(&temp_out);
@@ -1620,4 +1733,134 @@ pub async fn get_video_stats(db: State<'_, DbState>) -> Result<serde_json::Value
         "total_size_bytes": total_size,
         "total_duration_secs": total_duration,
     }))
+}
+
+/// Show a file or folder in Finder: a file is selected in its folder, a
+/// folder is opened. (The shell plugin's `open` only accepts web links.)
+#[tauri::command]
+pub async fn reveal_in_finder(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("{} no longer exists", path));
+    }
+    let mut cmd = std::process::Command::new("open");
+    if p.is_file() {
+        cmd.arg("-R");
+    }
+    cmd.arg(p)
+        .status()
+        .map_err(|e| e.to_string())
+        .and_then(|s| if s.success() { Ok(()) } else { Err(format!("Could not open {}", path)) })
+}
+
+/// Move a file to the Trash through Finder, so it can be put back. The path
+/// goes in as an argument, never into the script text.
+pub fn move_to_trash(path: &str) -> Result<(), String> {
+    let out = std::process::Command::new("osascript")
+        .args([
+            "-e", "on run argv",
+            "-e", "tell application \"Finder\" to delete (POSIX file (item 1 of argv) as alias)",
+            "-e", "end run",
+            path,
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("Could not move {} to the Trash: {}", path, String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
+#[cfg(test)]
+mod merge_name_tests {
+    use super::next_merge_name;
+
+    #[test]
+    fn fills_the_first_free_number() {
+        let dir = std::env::temp_dir().join(format!("vv-merge-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(next_merge_name(&dir), "video_merge_01.mp4");
+        for f in ["video_merge_01.mp4", "video_merge_03.mp4", "Video_Merge_02.MOV", "other.mp4"] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        // 02 is taken by a .MOV (case-insensitive), 03 exists, so the gap is 04
+        assert_eq!(next_merge_name(&dir), "video_merge_04.mp4");
+        std::fs::remove_file(dir.join("video_merge_01.mp4")).unwrap();
+        assert_eq!(next_merge_name(&dir), "video_merge_01.mp4");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod reindex_tests {
+    use super::{forget_video_row, is_same_file_as_row, file_modified_at};
+    use rusqlite::params;
+
+    #[test]
+    fn a_reused_name_is_a_different_file() {
+        let dir = std::env::temp_dir().join(format!("vv-reindex-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("video_merge_02.mp4").to_string_lossy().to_string();
+        let thumb = dir.join("old.jpg").to_string_lossy().to_string();
+        std::fs::write(&path, b"original bytes").unwrap();
+        std::fs::write(&thumb, b"jpg").unwrap();
+
+        let conn = crate::db::init_db(&dir.join("test.db").to_string_lossy()).unwrap();
+        conn.execute(
+            "INSERT INTO videos (id, path, filename, folder, size_bytes, thumbnail_path, modified_at, indexed_at, is_deleted)
+             VALUES ('v1', ?1, 'video_merge_02.mp4', ?2, ?3, ?4, ?5, 'now', 1)",
+            params![path, dir.to_string_lossy(), 14i64, thumb, file_modified_at(&path)],
+        ).unwrap();
+
+        // Same bytes and time: the restored file is the same video
+        assert!(is_same_file_as_row(&conn, "v1", &path));
+
+        // A new file under the old name
+        std::fs::write(&path, b"a completely different merge").unwrap();
+        assert!(!is_same_file_as_row(&conn, "v1", &path));
+        forget_video_row(&conn, "v1");
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM videos", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
+        assert!(!std::path::Path::new(&thumb).exists(), "old thumbnail removed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// Duration and size of any video file, for clips that aren't in the library.
+#[tauri::command]
+pub async fn probe_media(path: String) -> Result<serde_json::Value, String> {
+    let m = tokio::task::block_in_place(|| ffmpeg::probe_video(&path)).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "duration_secs": m.duration_secs,
+        "width": m.width,
+        "height": m.height,
+        "fps": m.fps,
+        "size_bytes": m.size_bytes,
+    }))
+}
+
+/// Add one file to the library now (instead of waiting for the folder
+/// watcher) and return it, e.g. to play a merge the moment it's written.
+#[tauri::command]
+pub async fn index_video_path(
+    path: String,
+    db: State<'_, DbState>,
+    thumb_dir: State<'_, ThumbDirState>,
+) -> Result<VideoFile, String> {
+    let thumb = thumb_dir.0.clone();
+    if let Some(v) = tokio::task::block_in_place(|| index_single_video(&*db, &path, &thumb)) {
+        return Ok(v);
+    }
+    // Already indexed (e.g. the watcher got there first)
+    let id: String = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT id FROM videos WHERE path = ?1 AND is_deleted = 0",
+            params![path],
+            |r| r.get(0),
+        )
+        .map_err(|_| format!("Could not add {} to the library", path))?
+    };
+    get_video_by_id_internal(&*db, &id).map_err(|e| e.to_string())
 }

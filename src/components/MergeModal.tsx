@@ -1,20 +1,45 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { save } from '@tauri-apps/plugin-dialog'
 import { listen } from '@tauri-apps/api/event'
 import {
   Merge, X, ChevronUp, ChevronDown, Scissors, Play, Pause,
-  SkipBack, SkipForward,
+  SkipBack, SkipForward, Timer, AlertTriangle,
 } from 'lucide-react'
 import { useStore } from '@/store'
 import { cn, formatDuration, formatFileSize, getThumbnailSrc, getVideoSrc } from '@/lib/utils'
-import type { VideoFile } from '@/types'
+import { isFileClip } from '@/lib/intro'
+import { MIX_SPLITS, MIX_TOTAL, type BigPart } from '@/lib/merge'
+import type { MergePreset, VideoFile } from '@/types'
 
 interface Clip {
   video: VideoFile
   /** seconds cut from the start of THIS clip (independently editable) */
   trimSecs: number
+  /** seconds kept after the trim; undefined keeps the rest of the clip */
+  keepSecs?: number
 }
+
+
+
+/**
+ * The two clips of an 8-second mix: shorter video first, keeping its opening
+ * `small` seconds, then `big` seconds of the longer one, from its end or start.
+ * With `keepOrder` (an intro merge) the first clip takes the short part
+ * whatever its length.
+ */
+function mixClips(clips: Clip[], split: (typeof MIX_SPLITS)[number], bigPart: BigPart, keepOrder = false): Clip[] {
+  const [small, big] = keepOrder ? clips : [...clips].sort((a, b) => a.video.duration_secs - b.video.duration_secs)
+  return [
+    { video: small.video, trimSecs: 0, keepSecs: split.small },
+    {
+      video: big.video,
+      trimSecs: bigPart === 'end' ? Math.max(0, big.video.duration_secs - split.big) : 0,
+      keepSecs: split.big,
+    },
+  ]
+}
+
+const fmtSecs = (n: number) => `${Number(n.toFixed(2))}s`
 
 const CLIP_COLORS = [
   '#6366f1', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981',
@@ -22,13 +47,18 @@ const CLIP_COLORS = [
 ]
 
 export function MergeModal() {
-  const { showMergeModal, setShowMergeModal, selectedVideoIds, videos, clearSelection } = useStore()
+  const { showMergeModal, setShowMergeModal, selectedVideoIds, videos } = useStore()
 
   const [clips, setClips] = useState<Clip[]>([])
   const [trimSecs, setTrimSecs] = useState(0)
   const [progress, setProgress] = useState<number | null>(null)
   const [done, setDone] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  /** 8-second mix: index into MIX_SPLITS, or null for a normal merge */
+  const [mix, setMix] = useState<number | null>(null)
+  const [bigPart, setBigPart] = useState<BigPart>('end')
+  /** Fixed clips this dialog was opened with (intro merges) */
+  const [preset, setPreset] = useState<MergePreset | null>(null)
 
   // ── Preview player state ──────────────────────────────────────────────────
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -40,12 +70,22 @@ export function MergeModal() {
   // Reset everything when the modal opens
   useEffect(() => {
     if (showMergeModal) {
-      setClips(
-        videos
-          .filter((v) => selectedVideoIds.has(v.id))
-          .map((video) => ({ video, trimSecs: 0 }))
-      )
+      const p = useStore.getState().mergePreset
+      setPreset(p)
+      if (p) {
+        // Intro merge: intro on top, the 8-second mix on from the start
+        setClips(mixClips(p.clips.map((video) => ({ video, trimSecs: 0 })), MIX_SPLITS[0], 'end', p.introFirst))
+        setMix(0)
+      } else {
+        setClips(
+          videos
+            .filter((v) => selectedVideoIds.has(v.id))
+            .map((video) => ({ video, trimSecs: 0 }))
+        )
+        setMix(null)
+      }
       setTrimSecs(0)
+      setBigPart('end')
       setProgress(null)
       setDone(null)
       setError(null)
@@ -55,17 +95,58 @@ export function MergeModal() {
     }
   }, [showMergeModal])
 
+  // However the dialog closes (buttons or Esc), a finished merge leaves
+  // nothing selected
+  useEffect(() => {
+    if (!showMergeModal && done) {
+      useStore.getState().clearSelection()
+      setDone(null)
+    }
+  }, [showMergeModal, done])
+
   /** effective start offset of a clip in its source file */
   const clipOffset = useCallback(
     (clip: Clip) => Math.min(Math.max(0, clip.trimSecs), clip.video.duration_secs),
     []
   )
 
-  /** post-trim duration of a clip */
+  /** post-trim duration of a clip, capped by what it keeps */
   const clipDuration = useCallback(
-    (clip: Clip) => Math.max(0, clip.video.duration_secs - clipOffset(clip)),
+    (clip: Clip) => {
+      const rest = Math.max(0, clip.video.duration_secs - clipOffset(clip))
+      return clip.keepSecs != null ? Math.min(clip.keepSecs, rest) : rest
+    },
     [clipOffset]
   )
+
+  /** Switch the 8-second mix on (a split index), change its options, or turn it off */
+  const applyMix = (next: number | null, part: BigPart = bigPart) => {
+    setMix(next)
+    setBigPart(part)
+    setClips((cs) =>
+      next == null
+        ? cs.map((c) => ({ video: c.video, trimSecs: 0 }))
+        : mixClips(cs, MIX_SPLITS[next], part, !!preset?.introFirst)
+    )
+    setTrimSecs(0)
+    setActiveClipIdx(0)
+    setClipPos(0)
+    pendingSeek.current = null
+  }
+
+  /** Why the chosen split can't make a full 8 seconds, if it can't */
+  const mixProblem = useMemo(() => {
+    if (mix == null || clips.length !== 2) return null
+    const split = MIX_SPLITS[mix]
+    const [small, big] = clips
+    if (small.video.duration_secs < split.small) {
+      return `${small.video.filename} is ${fmtSecs(small.video.duration_secs)}, shorter than the ${fmtSecs(split.small)} it should give.`
+    }
+    if (big.video.duration_secs < split.big) {
+      return `${big.video.filename} is ${fmtSecs(big.video.duration_secs)}, shorter than the ${fmtSecs(split.big)} it should give.`
+    }
+    return null
+  }, [mix, clips])
 
   const totalDuration = useMemo(
     () => clips.reduce((sum, c) => sum + clipDuration(c), 0),
@@ -117,6 +198,12 @@ export function MergeModal() {
     // Never show the trimmed head: if a seek landed before the offset, snap forward
     if (el.currentTime < off - 0.05) {
       el.currentTime = off
+      return
+    }
+    // A clip that keeps only part of its video stops at its end point
+    if (activeClip.keepSecs != null && el.currentTime >= off + clipDuration(activeClip) - 0.02) {
+      el.pause()
+      handleEnded()
       return
     }
     setClipPos(Math.max(0, el.currentTime - off))
@@ -191,6 +278,24 @@ export function MergeModal() {
     else if (activeClipIdx === j) setActiveClipIdx(idx)
   }
 
+  /** Take a clip out of this merge (the video itself is untouched) */
+  const removeClip = (idx: number) => {
+    const next = clips.filter((_, i) => i !== idx)
+    // The 8-second mix needs exactly two clips
+    if (mix != null && next.length !== 2) {
+      setMix(null)
+      setClips(next.map((c) => ({ video: c.video, trimSecs: 0 })))
+    } else {
+      setClips(next)
+    }
+    videoRef.current?.pause()
+    setPlaying(false)
+    pendingSeek.current = null
+    setClipPos(0)
+    setActiveClipIdx((a) => (a > idx ? a - 1 : a === idx ? Math.min(idx, next.length - 1) : a))
+    setDone(null)
+  }
+
   const setClipTrim = (idx: number, secs: number) => {
     setClips((cs) => cs.map((c, i) => (i === idx ? { ...c, trimSecs: Math.max(0, secs) } : c)))
   }
@@ -204,15 +309,11 @@ export function MergeModal() {
 
   // ── Merge ────────────────────────────────────────────────────────────────
   const handleMerge = async () => {
-    const outputPath = await save({
-      defaultPath: 'merged_video.mp4',
-      filters: [{ name: 'Video', extensions: ['mp4'] }],
-    })
-    if (!outputPath) return
-
-    const parts = outputPath.split('/')
-    const outputFilename = parts.pop()!
-    const outputFolder = parts.join('/')
+    // Saved in the initial folder of the view (the first one shown, not ones
+    // added after it) as the next free video_merge_NN.mp4, picked by the
+    // backend. With no folder chosen, next to the first clip.
+    const outputFolder = mergeFolder
+    if (!outputFolder) return
 
     videoRef.current?.pause()
     setPlaying(false)
@@ -225,18 +326,23 @@ export function MergeModal() {
     })
 
     try {
-      await invoke('merge_videos', {
+      const outputPath = await invoke<string>('merge_videos', {
         request: {
           clips: clips.map((c) => ({
             video_id: c.video.id,
             start_offset_secs: clipOffset(c),
+            path: isFileClip(c.video) ? c.video.path : null,
+            duration_secs: c.keepSecs ?? null,
           })),
-          output_filename: outputFilename,
+          output_filename: null,
           output_folder: outputFolder,
+          total_duration_secs: mix != null ? MIX_TOTAL : null,
+          quality: useStore.getState().settings.mergeQuality,
         },
       })
       setDone(outputPath)
-      clearSelection()
+      // A finished merge leaves nothing selected
+      useStore.getState().clearSelection()
     } catch (e) {
       setError(String(e))
     } finally {
@@ -244,7 +350,15 @@ export function MergeModal() {
     }
   }
 
+  const closeModal = () => {
+    videoRef.current?.pause()
+    setShowMergeModal(false)
+  }
+
   if (!showMergeModal) return null
+
+  const initialFolder = preset ? undefined : useStore.getState().activeFolders[0]
+  const mergeFolder = preset?.outputFolder ?? initialFolder ?? clips[0]?.video.folder
 
   const merging = progress !== null && !done
 
@@ -255,13 +369,15 @@ export function MergeModal() {
         <div className="flex items-center justify-between px-5 py-4 border-b border-[#2a2a3a] flex-shrink-0">
           <div className="flex items-center gap-2">
             <Merge size={18} className="text-[#6366f1]" />
-            <h2 className="text-base font-semibold text-[#e8e8f0]">Merge Videos</h2>
+            <h2 className="text-base font-semibold text-[#e8e8f0] truncate max-w-md" title={preset?.title}>
+              {preset ? 'Merge with intro' : 'Merge Videos'}
+            </h2>
             <span className="text-xs text-[#55556a] ml-2">
-              {clips.length} clips · Output: {formatDuration(totalDuration)}
+              {clips.length} clips · Output: {mix != null ? fmtSecs(Math.min(MIX_TOTAL, totalDuration)) : formatDuration(totalDuration)}
             </span>
           </div>
           <button
-            onClick={() => { videoRef.current?.pause(); setShowMergeModal(false) }}
+            onClick={closeModal}
             className="text-[#55556a] hover:text-white transition-all"
           >
             <X size={18} />
@@ -272,7 +388,65 @@ export function MergeModal() {
         <div className="flex flex-1 min-h-0">
           {/* ── Left panel ── */}
           <div className="w-80 flex-shrink-0 border-r border-[#2a2a3a] flex flex-col min-h-0">
+            {/* 8-second mix: two clips, shorter first, fixed split */}
+            {clips.length === 2 && (
+              <div className="px-4 py-3 border-b border-[#2a2a3a] flex-shrink-0 space-y-2">
+                <div className="flex items-center gap-2 text-xs text-[#8888aa]">
+                  <Timer size={12} className="text-[#6366f1] flex-shrink-0" />
+                  <span>8-second mix</span>
+                </div>
+                <div className="grid grid-cols-4 bg-[#0d0d14] border border-[#2a2a3a] rounded-lg p-0.5">
+                  {[null, 0, 1, 2].map((i) => (
+                    <button
+                      key={i ?? 'off'}
+                      onClick={() => applyMix(i)}
+                      className={cn(
+                        'py-1 rounded text-[11px] font-medium tabular-nums transition-all',
+                        mix === i ? 'bg-[#2a2a3a] text-white' : 'text-[#55556a] hover:text-[#8888aa]'
+                      )}
+                      title={i == null ? 'Normal merge' : `${MIX_SPLITS[i].big}s of the longer video + ${MIX_SPLITS[i].small}s of the shorter`}
+                    >
+                      {i == null ? 'Off' : `${MIX_SPLITS[i].big}+${MIX_SPLITS[i].small}`}
+                    </button>
+                  ))}
+                </div>
+                {mix != null && (
+                  <>
+                    <div className="flex items-center justify-between text-[11px] text-[#8888aa]">
+                      <span>{preset?.introFirst ? 'The video keeps its' : 'Longer video keeps its'}</span>
+                      <div className="flex bg-[#0d0d14] border border-[#2a2a3a] rounded-md p-0.5">
+                        {(['end', 'start'] as const).map((p) => (
+                          <button
+                            key={p}
+                            onClick={() => applyMix(mix, p)}
+                            className={cn(
+                              'px-2 py-0.5 rounded text-[10px] font-medium transition-all',
+                              bigPart === p ? 'bg-[#2a2a3a] text-white' : 'text-[#55556a] hover:text-[#8888aa]'
+                            )}
+                          >
+                            {p === 'end' ? `Last ${MIX_SPLITS[mix].big}s` : `First ${MIX_SPLITS[mix].big}s`}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <p className="text-[10px] text-[#55556a] leading-relaxed">
+                      {preset?.introFirst
+                        ? `Intro on top (its first ${MIX_SPLITS[mix].small}s), then the video.`
+                        : `Shorter video first (its first ${MIX_SPLITS[mix].small}s), then the longer one.`}
+                      {' '}Output is exactly {MIX_TOTAL}s.
+                    </p>
+                    {mixProblem && (
+                      <p className="flex items-start gap-1 text-[10px] text-amber-400">
+                        <AlertTriangle size={11} className="mt-px flex-shrink-0" /> {mixProblem}
+                      </p>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
             {/* Global trim control — bulk-sets every clip's trim value */}
+            {mix == null && (
             <div className="px-4 py-3 border-b border-[#2a2a3a] flex-shrink-0">
               <label className="flex items-center gap-2 text-xs text-[#8888aa]">
                 <Scissors size={12} className="text-[#6366f1] flex-shrink-0" />
@@ -292,6 +466,7 @@ export function MergeModal() {
                 Fine-tune each clip's trim individually below (0 = keep full clip)
               </p>
             </div>
+            )}
 
             {/* Clip list */}
             <div className="flex-1 overflow-y-auto p-3 space-y-1.5">
@@ -336,7 +511,15 @@ export function MergeModal() {
                     <div className="flex-1 min-w-0">
                       <p className="text-xs text-[#e8e8f0] truncate">{clip.video.filename}</p>
                       <p className="text-[10px] text-[#55556a]">
-                        {isTrimmed ? (
+                        {clip.keepSecs != null ? (
+                          <>
+                            <span className="text-[#6366f1]">{fmtSecs(clipDuration(clip))}</span>
+                            <span className="ml-1">
+                              ({off > 0 ? `${fmtSecs(off)}–${fmtSecs(off + clipDuration(clip))}` : `first ${fmtSecs(clipDuration(clip))}`}
+                              {' '}of {formatDuration(clip.video.duration_secs)})
+                            </span>
+                          </>
+                        ) : isTrimmed ? (
                           <>
                             <span className="line-through mr-1">{formatDuration(clip.video.duration_secs)}</span>
                             <span className="text-[#6366f1]">{formatDuration(clipDuration(clip))}</span>
@@ -349,7 +532,7 @@ export function MergeModal() {
                     </div>
 
                     {/* Per-clip trim input (seconds cut from the start) */}
-                    <label
+                    {mix == null && <label
                       onClick={(e) => e.stopPropagation()}
                       title="Seconds trimmed from the start of this clip"
                       className={cn(
@@ -373,9 +556,9 @@ export function MergeModal() {
                         )}
                       />
                       <span className="text-[9px] text-[#55556a]">s</span>
-                    </label>
+                    </label>}
 
-                    <div className="flex flex-col gap-0.5 flex-shrink-0">
+                    {mix == null && <div className="flex flex-col gap-0.5 flex-shrink-0">
                       <button
                         onClick={(e) => { e.stopPropagation(); move(idx, -1) }}
                         disabled={idx === 0}
@@ -390,10 +573,21 @@ export function MergeModal() {
                       >
                         <ChevronDown size={12} />
                       </button>
-                    </div>
+                    </div>}
+
+                    <button
+                      onClick={(e) => { e.stopPropagation(); removeClip(idx) }}
+                      className="p-1 rounded text-[#55556a] hover:text-red-400 hover:bg-red-500/10 flex-shrink-0 transition-all"
+                      title="Remove from this merge (the video stays in your library)"
+                    >
+                      <X size={12} />
+                    </button>
                   </div>
                 )
               })}
+              {clips.length === 1 && (
+                <p className="text-[11px] text-[#55556a] text-center py-2">A merge needs at least two videos.</p>
+              )}
             </div>
           </div>
 
@@ -524,24 +718,36 @@ export function MergeModal() {
             </div>
           )}
 
+          {mergeFolder && (
+            <p className="mb-2 text-[11px] text-[#55556a] truncate" title={mergeFolder}>
+              Saves to <span className="text-[#8888aa]">{mergeFolder.split('/').pop()}/video_merge_NN.mp4</span>
+              {preset ? ' (next to the video)' : initialFolder ? ' (the first folder you opened)' : ''}
+              {' '}· next free number
+            </p>
+          )}
           <div className="flex items-center justify-between">
             <span className="text-xs text-[#55556a]">
-              {clips.some((c) => c.trimSecs > 0)
+              {mix != null && clips.length === 2
+                ? `8-second mix: first ${fmtSecs(clipDuration(clips[0]))} of ${clips[0].video.filename} + ${
+                    bigPart === 'end' ? 'last' : 'first'} ${fmtSecs(clipDuration(clips[1]))} of ${clips[1].video.filename}`
+                : clips.some((c) => c.trimSecs > 0)
                 ? `Trimming ${clips.filter((c) => c.trimSecs > 0).length} of ${clips.length} clips (${formatDuration(
                     clips.reduce((sum, c) => sum + clipOffset(c), 0)
                   )} cut in total)`
                 : 'No intro trim'}
             </span>
             <div className="flex items-center gap-3">
+              <MergeQualityToggle />
               <button
-                onClick={() => { videoRef.current?.pause(); setShowMergeModal(false) }}
+                onClick={closeModal}
                 className="px-4 py-2 text-sm text-[#8888aa] hover:text-white transition-all"
               >
                 Cancel
               </button>
               <button
                 onClick={handleMerge}
-                disabled={merging || clips.length < 2}
+                title={mergeFolder ? `Saves as the next video_merge_NN.mp4 in ${mergeFolder}` : undefined}
+                disabled={merging || clips.length < 2 || !!mixProblem}
                 className="px-4 py-2 text-sm bg-[#6366f1] hover:bg-[#7c7ff5] text-white rounded-lg transition-all disabled:opacity-50 flex items-center gap-2"
               >
                 <Merge size={14} />
@@ -551,6 +757,33 @@ export function MergeModal() {
           </div>
         </div>
       </div>
+    </div>
+  )
+}
+
+/** High keeps the largest clip's resolution at near-source quality; Smaller caps at 1080p. */
+function MergeQualityToggle() {
+  const quality = useStore((s) => s.settings.mergeQuality)
+  const updateSettings = useStore((s) => s.updateSettings)
+  const options = [
+    { value: 'high', label: 'High quality', hint: 'Largest clip’s resolution and frame rate, near-source quality' },
+    { value: 'small', label: 'Smaller file', hint: 'Up to 1080p, more compression' },
+  ] as const
+  return (
+    <div className="flex bg-[#0d0d14] border border-[#2a2a3a] rounded-lg p-0.5">
+      {options.map((o) => (
+        <button
+          key={o.value}
+          onClick={() => updateSettings({ mergeQuality: o.value })}
+          title={o.hint}
+          className={cn(
+            'px-2.5 py-1 rounded text-[11px] font-medium transition-all',
+            quality === o.value ? 'bg-[#2a2a3a] text-white' : 'text-[#55556a] hover:text-[#8888aa]'
+          )}
+        >
+          {o.label}
+        </button>
+      ))}
     </div>
   )
 }

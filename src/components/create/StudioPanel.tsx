@@ -1,25 +1,29 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
-import { Image as ImageIcon, Film, Plus, X, Gem, Loader2, AlertTriangle, ChevronDown } from 'lucide-react'
+import {
+  Image as ImageIcon, Film, Plus, X, Gem, Loader2, AlertTriangle, ChevronDown, User, Shapes, Music,
+} from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '@/store'
 import { showConfirm } from '@/lib/dialog'
 import { cn, getThumbnailSrc } from '@/lib/utils'
 import {
-  defaultModelId, defaultToken, fieldLabel, hasSchemaField, maxImages,
-  mentionSupport, optionFields, tokenLabel, variantsOf,
+  approxSize, defaultModelId, defaultToken, fieldLabel, hasSchemaField, maxImages,
+  mentionedHandles, mentionSupport, optionFields, parseRatio, removeMention, tokenLabel, variantsOf,
 } from '@/lib/mage'
 import { PromptInput } from './PromptInput'
-import type { MageArchitecture, MageGeneration } from '@/types'
+import type { MageArchitecture, MageCostEstimate, MageEntity, MageGeneration } from '@/types'
 
 /** Preferred starting model per media type; falls back to the first listed. */
 const PREFERRED: Record<'image' | 'video', string> = { image: 'mango', video: 'lemon' }
 
-/** Ask before submitting anything at or above this many gems (default settings). */
-const CONFIRM_GEMS = 100
-
 export const DRAG_MIME = 'application/x-videovault-image'
+/** An image dragged out of a Studio slot: JSON `{ path, from }` */
+const SLOT_MIME = 'application/x-videovault-slot'
+
+type Slot = 'first' | 'last' | 'ref'
+const SLOT_LABEL: Record<Slot, string> = { first: 'First', last: 'Last', ref: 'Refs' }
 
 export function StudioPanel({ loadError }: { loadError: string | null }) {
   const { draft, updateDraft, architectures, balance } = useStore(
@@ -88,12 +92,14 @@ function StudioForm({
   setShowAdvanced: (v: boolean) => void
   balance: number | null
 }) {
-  const { draft, updateDraft, entities, upsertGeneration } = useStore(
+  const { draft, updateDraft, entities, upsertGeneration, confirmGems, generations } = useStore(
     useShallow((s) => ({
       draft: s.mageDraft,
       updateDraft: s.updateMageDraft,
       entities: s.mageEntities,
       upsertGeneration: s.upsertMageGeneration,
+      confirmGems: s.settings.mageConfirmGems,
+      generations: s.mageGenerations,
     }))
   )
 
@@ -152,32 +158,96 @@ function StudioForm({
   const addReferences = (paths: string[]) =>
     updateDraft({ references: [...references, ...paths.filter((p) => !references.includes(p))].slice(0, refCapacity) })
 
+  /** Slots this model has, as move targets */
+  const slots: Slot[] = [
+    ...(firstField ? ['first' as const] : []),
+    ...(lastField ? ['last' as const] : []),
+    ...(refs ? ['ref' as const] : []),
+  ]
+
+  /**
+   * Put an image into a slot. Moving between slots takes it out of its old
+   * one; a frame it lands on is swapped back into the slot it came from.
+   * `from` is null for a new image (picked, or dragged from the gallery).
+   */
+  const placeImage = (path: string, from: Slot | null, to: Slot) => {
+    if (from === to) return
+    const d = useStore.getState().mageDraft
+    let refList = d.references.slice(0, refCapacity)
+    let first = d.firstFrame
+    let last = d.lastFrame
+    const refIndex = refList.indexOf(path)
+
+    if (from === 'ref') refList = refList.filter((p) => p !== path)
+    if (from === 'first') first = null
+    if (from === 'last') last = null
+
+    if (to === 'ref') {
+      if (!refList.includes(path)) {
+        if (refList.length >= refCapacity) {
+          setError(`The reference list is full (${refCapacity}). Remove one first.`)
+          return
+        }
+        refList = [...refList, path]
+      }
+    } else {
+      const displaced = to === 'first' ? first : last
+      if (to === 'first') first = path
+      else last = path
+      if (displaced && displaced !== path) {
+        if (from === 'first') first = displaced
+        else if (from === 'last') last = displaced
+        else if (from === 'ref') refList.splice(Math.max(0, refIndex), 0, displaced)
+      }
+    }
+    setError(null)
+    updateDraft({ references: refList, firstFrame: first, lastFrame: last })
+  }
+
+  /** Move both frames into the reference list (models that refuse the mix) */
+  const framesToReferences = () => {
+    for (const [slot, path] of [['first', draft.firstFrame], ['last', draft.lastFrame]] as const) {
+      if (path) placeImage(path, slot, 'ref')
+    }
+  }
+
+  // The request exactly as it will be submitted, so the quote matches the charge
+  const config: Record<string, unknown> = { prompt: draft.prompt.trim() }
+  if (variants.length > 1 && modelId) config.model_id = modelId
+  for (const { field, tokens } of fields) config[field] = valueOf(field, tokens)
+  for (const extra of ['negative_prompt', 'seed', 'use_character_voices']) {
+    const v = draft.config[extra]
+    if (v !== undefined && v !== '' && v !== null) config[extra] = v
+  }
+  const inputs: Record<string, string | string[]> = {}
+  if (refs && references.length) {
+    inputs[refs.field] = references[0]
+    if (refs.additional_field && references.length > 1) inputs[refs.additional_field] = references.slice(1)
+  }
+  if (firstField && draft.firstFrame) inputs[firstField] = draft.firstFrame
+  if (lastField && draft.lastFrame) inputs[lastField] = draft.lastFrame
+
+  const quote = useCostEstimate(arch.id, config, inputs, missing.length === 0)
+  const price = quote.estimate?.gems ?? null
+  const priceForChecks = price ?? arch.gems
+
+  // Mentioned characters and references, for the chips under the prompt
+  const selected = useMemo(() => {
+    const byHandle = new Map(entities.map((e) => [e.handle.toLowerCase(), e]))
+    return mentionedHandles(draft.prompt).map((h) => byHandle.get(h)).filter((e): e is MageEntity => !!e)
+  }, [draft.prompt, entities])
+
   const submit = async () => {
     setError(null)
-    if (arch.type === 'video' || arch.gems >= CONFIRM_GEMS) {
+    // confirmGems: 0 asks every time, -1 never asks
+    if (confirmGems >= 0 && priceForChecks >= confirmGems) {
       const ok = await showConfirm(
-        `Generate with ${arch.name}?\n` +
-        `About ${Math.round(arch.gems)} gems at default settings. Resolution, duration and references change the exact charge.\n` +
-        `Gems are not returned if you cancel.`
+        `Generate with ${arch.name} for ${price != null ? '' : 'about '}${Math.round(priceForChecks)} gems?\n` +
+        (price == null ? 'Mage could not quote this exact request; this is the price at default settings.\n' : '') +
+        `You are asked because it is at least ${confirmGems} gems (change this in Settings → Mage).`
       )
       if (!ok) return
     }
-
-    const config: Record<string, unknown> = { prompt: draft.prompt.trim() }
-    if (variants.length > 1 && modelId) config.model_id = modelId
-    for (const { field, tokens } of fields) config[field] = valueOf(field, tokens)
-    for (const extra of ['negative_prompt', 'seed', 'use_character_voices']) {
-      const v = draft.config[extra]
-      if (v !== undefined && v !== '' && v !== null) config[extra] = v
-    }
-
-    const inputs: Record<string, string | string[]> = {}
-    if (refs && references.length) {
-      inputs[refs.field] = references[0]
-      if (refs.additional_field && references.length > 1) inputs[refs.additional_field] = references.slice(1)
-    }
-    if (firstField && draft.firstFrame) inputs[firstField] = draft.firstFrame
-    if (lastField && draft.lastFrame) inputs[lastField] = draft.lastFrame
 
     setSubmitting(true)
     try {
@@ -190,6 +260,21 @@ function StudioForm({
     } finally {
       setSubmitting(false)
     }
+  }
+
+  // Output size per ratio: exact when a past result used the same settings
+  const resolutionField = fields.find((f) => f.field === 'resolution')
+  const resolution = resolutionField ? valueOf('resolution', resolutionField.tokens) : undefined
+  const sizeFor = (ratio: string): { w: number; h: number; exact: boolean } | null => {
+    const past = generations.find((g) =>
+      g.architecture === arch.id && g.width && g.height &&
+      (variants.length <= 1 || g.model_id === modelId) &&
+      g.config.aspect_ratio === ratio &&
+      (resolution == null || g.config.resolution === resolution)
+    )
+    if (past) return { w: past.width!, h: past.height!, exact: true }
+    const approx = approxSize(ratio, resolution)
+    return approx && { ...approx, exact: false }
   }
 
   return (
@@ -225,15 +310,26 @@ function StudioForm({
               />
             </Field>
           )}
-          {fields.map(({ field, tokens }) => (
-            <Field key={field} label={fieldLabel(field)}>
-              <Select
-                value={valueOf(field, tokens)}
-                onChange={(v) => setConfig(field, v)}
-                options={tokens.map((t) => ({ value: t, label: tokenLabel(field, t) }))}
-              />
-            </Field>
-          ))}
+          {fields.map(({ field, tokens }) =>
+            field === 'aspect_ratio' ? (
+              <Field key={field} label="Aspect ratio">
+                <AspectPicker
+                  tokens={tokens}
+                  value={valueOf(field, tokens)}
+                  onChange={(v) => setConfig(field, v)}
+                  sizeOf={(ratio) => sizeFor(ratio)}
+                />
+              </Field>
+            ) : (
+              <Field key={field} label={fieldLabel(field)}>
+                <Select
+                  value={valueOf(field, tokens)}
+                  onChange={(v) => setConfig(field, v)}
+                  options={tokens.map((t) => ({ value: t, label: tokenLabel(field, t) }))}
+                />
+              </Field>
+            )
+          )}
         </div>
 
         {/* Prompt */}
@@ -252,6 +348,15 @@ function StudioForm({
                 : 'Subject, setting, light and framing'
             }
           />
+          {selected.length > 0 && (
+            <SelectedEntities
+              entities={selected}
+              isSupported={(e) =>
+                e.entity_type === 'character' ? mentions.characters
+                : e.kind === 'audio' ? mentions.audio : mentions.references}
+              onRemove={(e) => updateDraft({ prompt: removeMention(useStore.getState().mageDraft.prompt, e.handle) })}
+            />
+          )}
           {mentionWarnings.length > 0 && (
             <div className="mt-1.5 space-y-0.5">
               {mentionWarnings.map((w) => (
@@ -272,9 +377,11 @@ function StudioForm({
                 className={lastField ? undefined : 'col-span-2'}
               >
                 <ImageSlot
+                  slot="first"
                   path={draft.firstFrame}
-                  onPick={async () => { const [p] = await pickImages(false); if (p) updateDraft({ firstFrame: p }) }}
-                  onDropPath={(p) => updateDraft({ firstFrame: p })}
+                  targets={slots}
+                  onPick={async () => { const [p] = await pickImages(false); if (p) placeImage(p, null, 'first') }}
+                  onPlace={placeImage}
                   onClear={() => updateDraft({ firstFrame: null })}
                 />
               </Field>
@@ -282,9 +389,11 @@ function StudioForm({
             {lastField && (
               <Field label="Last frame">
                 <ImageSlot
+                  slot="last"
                   path={draft.lastFrame}
-                  onPick={async () => { const [p] = await pickImages(false); if (p) updateDraft({ lastFrame: p }) }}
-                  onDropPath={(p) => updateDraft({ lastFrame: p })}
+                  targets={slots}
+                  onPick={async () => { const [p] = await pickImages(false); if (p) placeImage(p, null, 'last') }}
+                  onPlace={placeImage}
                   onClear={() => updateDraft({ lastFrame: null })}
                 />
               </Field>
@@ -294,13 +403,16 @@ function StudioForm({
 
         {refs && (
           <Field label={`Reference images (${references.length}/${refCapacity})`}>
-            <DropZone onDropPath={(p) => addReferences([p])}>
+            <DropZone onDrop={(p, from) => placeImage(p, from, 'ref')}>
               <div className="grid grid-cols-4 gap-1.5">
                 {references.map((p, i) => (
                   <Thumb
                     key={p}
                     path={p}
+                    slot="ref"
                     badge={mentions.characters || mentions.references ? `@image${i + 1}` : undefined}
+                    moves={slots.filter((t) => t !== 'ref')}
+                    onMove={(to) => placeImage(p, 'ref', to)}
                     onClear={() => updateDraft({ references: references.filter((x) => x !== p) })}
                   />
                 ))}
@@ -377,8 +489,34 @@ function StudioForm({
       {/* Generate */}
       <div className="p-4 border-t border-[#2a2a3a] space-y-2">
         {error && <p className="text-[11px] text-red-400 break-words">{error}</p>}
-        {balance != null && arch.gems > balance && (
-          <p className="text-[11px] text-amber-400">Your balance ({Math.floor(balance)} gems) may not cover this.</p>
+        {quote.estimate?.refused && (
+          <div className="space-y-1.5">
+            <p className="flex items-start gap-1 text-[11px] text-amber-400 break-words">
+              <AlertTriangle size={11} className="mt-0.5 flex-shrink-0" /> Mage would refuse this: {quote.estimate.refused}
+            </p>
+            {(draft.firstFrame || draft.lastFrame) && references.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 pl-4">
+                {refs && (
+                  <button onClick={framesToReferences} className={FIX_BUTTON}>
+                    Move frames to references
+                  </button>
+                )}
+                {firstField && !draft.firstFrame && references.length === 1 && (
+                  <button onClick={() => placeImage(references[0], 'ref', 'first')} className={FIX_BUTTON}>
+                    Use the reference as first frame
+                  </button>
+                )}
+                <button onClick={() => updateDraft({ firstFrame: null, lastFrame: null })} className={FIX_BUTTON}>
+                  Remove frames
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+        {balance != null && priceForChecks > balance && (
+          <p className="text-[11px] text-amber-400">
+            Your balance ({Math.floor(balance)} gems) {price != null ? "doesn't" : 'may not'} cover this.
+          </p>
         )}
         <button
           onClick={submit}
@@ -388,16 +526,213 @@ function StudioForm({
         >
           {submitting ? <Loader2 size={14} className="animate-spin" /> : arch.type === 'video' ? <Film size={14} /> : <ImageIcon size={14} />}
           Generate
-          <span className="flex items-center gap-1 text-xs opacity-80">
-            · <Gem size={11} /> ~{Math.round(arch.gems)}
+          <span className="flex items-center gap-1 text-xs opacity-90 tabular-nums">
+            · <Gem size={11} /> {price != null ? Math.round(price) : `~${Math.round(arch.gems)}`}
+            {quote.loading && <Loader2 size={10} className="animate-spin opacity-70" />}
           </span>
         </button>
+        <p className="text-center text-[10px] text-[#55556a]" title={quote.error ?? undefined}>
+          {missing.length > 0
+            ? `~${Math.round(arch.gems)} gems at default settings`
+            : price != null
+              ? `Exact price from Mage${confirmGems >= 0 && price >= confirmGems ? ' · asks before generating' : ''}`
+              : quote.loading
+                ? 'Checking the exact price…'
+                : quote.error
+                  ? `Couldn't check the exact price; ~${Math.round(arch.gems)} is the default-settings price`
+                  : `~${Math.round(arch.gems)} gems at default settings`}
+        </p>
       </div>
     </PanelShell>
   )
 }
 
+// ── Price quote ─────────────────────────────────────────────────────────────
+
+/** Quotes already fetched, by request; a quote does not change within a session. */
+const quoteCache = new Map<string, MageCostEstimate>()
+
+/**
+ * Mage's exact price for the request, refreshed (debounced) as it changes.
+ * The prompt counts only through its @mentions, so typing doesn't re-quote.
+ */
+function useCostEstimate(
+  architecture: string,
+  config: Record<string, unknown>,
+  inputs: Record<string, string | string[]>,
+  enabled: boolean,
+) {
+  const prompt = String(config.prompt ?? '')
+  const key = JSON.stringify([architecture, { ...config, prompt: mentionedHandles(prompt) }, inputs])
+  const [state, setState] = useState<{ key: string; estimate?: MageCostEstimate; error?: string; loading: boolean }>(
+    { key: '', loading: false }
+  )
+  // Latest request for the timer, without making the effect depend on it
+  const latest = { architecture, config, inputs }
+  const latestRef = useRef(latest)
+  latestRef.current = latest
+
+  useEffect(() => {
+    if (!enabled) return
+    const cached = quoteCache.get(key)
+    if (cached) { setState({ key, estimate: cached, loading: false }); return }
+    let stale = false
+    setState((s) => ({ key, estimate: s.estimate, loading: true }))
+    const t = setTimeout(() => {
+      const r = latestRef.current
+      invoke<MageCostEstimate>('mage_estimate_cost', {
+        args: { architecture: r.architecture, config: r.config, inputs: r.inputs },
+      })
+        .then((estimate) => {
+          quoteCache.set(key, estimate)
+          if (!stale) setState({ key, estimate, loading: false })
+        })
+        .catch((e) => { if (!stale) setState({ key, error: String(e), loading: false }) })
+    }, 450)
+    return () => { stale = true; clearTimeout(t) }
+  }, [key, enabled])
+
+  if (!enabled) return { loading: false as const, estimate: undefined, error: undefined }
+  // While a new quote loads, the previous price stays out of sight
+  return {
+    loading: state.key !== key || state.loading,
+    estimate: state.key === key && !state.loading ? state.estimate : undefined,
+    error: state.key === key ? state.error : undefined,
+  }
+}
+
 // ── Building blocks ─────────────────────────────────────────────────────────
+
+/** A ratio drawn to shape, longest side `max` px; dashed square for "auto"-style tokens. */
+function RatioShape({ token, max, active }: { token: string; max: number; active?: boolean }) {
+  const r = parseRatio(token)
+  const min = Math.round(max / 4)
+  const box = r && (r[0] >= r[1]
+    ? { width: max, height: Math.max(min, (max * r[1]) / r[0]) }
+    : { width: Math.max(min, (max * r[0]) / r[1]), height: max })
+  return (
+    <span className="flex items-center justify-center flex-shrink-0" style={{ width: max, height: max }}>
+      <span
+        className={cn(
+          'rounded-[2px] border',
+          !box && 'border-dashed',
+          active ? 'border-[#a5a7ff] bg-[#6366f1]/30' : 'border-current'
+        )}
+        style={box ?? { width: max * 0.8, height: max * 0.8 }}
+      />
+    </span>
+  )
+}
+
+/** Aspect ratio dropdown: each option drawn to shape with its output size. */
+function AspectPicker({
+  tokens, value, onChange, sizeOf,
+}: {
+  tokens: string[]
+  value: string
+  onChange: (v: string) => void
+  sizeOf: (ratio: string) => { w: number; h: number; exact: boolean } | null
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const current = sizeOf(value)
+
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { e.stopPropagation(); setOpen(false) }
+    }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey, { capture: true })
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey, { capture: true })
+    }
+  }, [open])
+
+  const sizeText = (size: { w: number; h: number; exact: boolean } | null) =>
+    size ? `${size.exact ? '' : '≈'}${size.w}×${size.h}` : ''
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        onClick={() => setOpen(!open)}
+        title={current ? `Output ${current.exact ? '' : '≈ '}${current.w} × ${current.h} px · ${((current.w * current.h) / 1e6).toFixed(1)} MP` : value}
+        className={cn(INPUT, 'flex items-center gap-2 text-left', open && 'border-[#6366f1]')}
+      >
+        <RatioShape token={value} max={14} active />
+        <span className="font-medium">{tokenLabel('aspect_ratio', value)}</span>
+        <span className="ml-auto text-[10px] text-[#55556a] tabular-nums truncate">{sizeText(current)}</span>
+        <ChevronDown size={12} className={cn('flex-shrink-0 text-[#55556a] transition-transform', open && 'rotate-180')} />
+      </button>
+      {open && (
+        <div className="absolute left-0 right-0 top-full mt-1 z-30 max-h-72 overflow-y-auto bg-[#16161f] border border-[#2a2a3a] rounded-lg shadow-xl py-1">
+          {tokens.map((t) => {
+            const active = t === value
+            return (
+              <button
+                key={t}
+                onClick={() => { onChange(t); setOpen(false) }}
+                className={cn(
+                  'w-full flex items-center gap-2 px-2.5 py-1.5 text-left text-xs transition-colors',
+                  active ? 'bg-[#6366f1]/15 text-white' : 'text-[#c8c8d8] hover:bg-[#2a2a3a]'
+                )}
+              >
+                <RatioShape token={t} max={16} active={active} />
+                <span className="font-medium">{tokenLabel('aspect_ratio', t)}</span>
+                <span className="ml-auto text-[10px] text-[#55556a] tabular-nums">{sizeText(sizeOf(t))}</span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Characters and references the prompt mentions, each removable. */
+function SelectedEntities({
+  entities, isSupported, onRemove,
+}: {
+  entities: MageEntity[]
+  isSupported: (e: MageEntity) => boolean
+  onRemove: (e: MageEntity) => void
+}) {
+  return (
+    <div className="mt-2 flex flex-wrap gap-1.5">
+      {entities.map((e) => (
+        <span
+          key={e.id}
+          title={isSupported(e) ? `${e.name} (@${e.handle})` : `The selected model doesn't take @${e.handle}`}
+          className={cn(
+            'group/chip flex items-center gap-1.5 pl-0.5 pr-1 py-0.5 rounded-full border text-[11px] max-w-full',
+            isSupported(e) ? 'border-[#2a2a3a] bg-[#16161f] text-[#e8e8f0]' : 'border-amber-500/40 bg-amber-500/5 text-amber-300'
+          )}
+        >
+          <span className="w-5 h-5 rounded-full overflow-hidden bg-[#2a2a3a] flex-shrink-0 flex items-center justify-center text-[#55556a]">
+            {e.local_image_path || e.image_url ? (
+              <img src={e.local_image_path ? getThumbnailSrc(e.local_image_path) : e.image_url!} className="w-full h-full object-cover" alt="" />
+            ) : e.kind === 'audio' ? <Music size={10} /> : e.entity_type === 'character' ? <User size={10} /> : <Shapes size={10} />}
+          </span>
+          <span className="truncate max-w-[110px]">{e.name}</span>
+          <button
+            onClick={() => onRemove(e)}
+            className="w-4 h-4 rounded-full flex items-center justify-center text-[#55556a] hover:text-white hover:bg-white/10"
+            title={`Remove @${e.handle} from the prompt`}
+          >
+            <X size={10} />
+          </button>
+        </span>
+      ))}
+    </div>
+  )
+}
+
+const FIX_BUTTON =
+  'px-2 py-0.5 rounded-md border border-amber-500/40 text-[10px] text-amber-300 hover:bg-amber-500/10 hover:text-amber-200'
 
 const INPUT =
   'w-full bg-[#111118] border border-[#2a2a3a] focus:border-[#6366f1] rounded-lg px-2.5 py-1.5 text-xs text-[#e8e8f0] placeholder-[#55556a] outline-none'
@@ -455,16 +790,38 @@ function Select({
   )
 }
 
-function DropZone({ onDropPath, children }: { onDropPath: (p: string) => void; children: React.ReactNode }) {
+/** Accepts gallery images and images dragged from another Studio slot. */
+function DropZone({
+  onDrop, children,
+}: {
+  onDrop: (path: string, from: Slot | null) => void
+  children: React.ReactNode
+}) {
   const [over, setOver] = useState(false)
+  const accepts = (e: React.DragEvent) =>
+    e.dataTransfer.types.includes(DRAG_MIME) || e.dataTransfer.types.includes(SLOT_MIME)
   return (
     <div
-      onDragOver={(e) => { if (e.dataTransfer.types.includes(DRAG_MIME)) { e.preventDefault(); setOver(true) } }}
+      onDragOver={(e) => {
+        if (!accepts(e)) return
+        e.preventDefault()
+        e.dataTransfer.dropEffect = e.dataTransfer.types.includes(SLOT_MIME) ? 'move' : 'copy'
+        setOver(true)
+      }}
       onDragLeave={() => setOver(false)}
       onDrop={(e) => {
         setOver(false)
+        const slot = e.dataTransfer.getData(SLOT_MIME)
+        if (slot) {
+          e.preventDefault()
+          try {
+            const { path, from } = JSON.parse(slot) as { path: string; from: Slot }
+            onDrop(path, from)
+          } catch { /* not ours */ }
+          return
+        }
         const p = e.dataTransfer.getData(DRAG_MIME)
-        if (p) { e.preventDefault(); onDropPath(p) }
+        if (p) { e.preventDefault(); onDrop(p, null) }
       }}
       className={cn('rounded-lg transition-all', over && 'ring-2 ring-[#6366f1] ring-offset-2 ring-offset-[#0d0d14]')}
     >
@@ -473,12 +830,31 @@ function DropZone({ onDropPath, children }: { onDropPath: (p: string) => void; c
   )
 }
 
-function Thumb({ path, badge, onClear }: { path: string; badge?: string; onClear: () => void }) {
+/** An image in a slot: drag it to another slot, or use the move buttons on hover. */
+function Thumb({
+  path, slot, badge, moves = [], onMove, onClear,
+}: {
+  path: string
+  slot: Slot
+  badge?: string
+  /** Slots it can move to */
+  moves?: Slot[]
+  onMove?: (to: Slot) => void
+  onClear: () => void
+}) {
   return (
-    <div className="group relative aspect-square rounded-md overflow-hidden bg-[#16161f] border border-[#2a2a3a]" title={path}>
-      <img src={getThumbnailSrc(path)} className="w-full h-full object-cover" alt="" />
+    <div
+      draggable
+      onDragStart={(e) => {
+        e.dataTransfer.setData(SLOT_MIME, JSON.stringify({ path, from: slot }))
+        e.dataTransfer.effectAllowed = 'move'
+      }}
+      className="group relative aspect-square rounded-md overflow-hidden bg-[#16161f] border border-[#2a2a3a] cursor-grab active:cursor-grabbing"
+      title={`${path}\nDrag to another slot to move it`}
+    >
+      <img src={getThumbnailSrc(path)} className="w-full h-full object-cover pointer-events-none" alt="" />
       {badge && (
-        <span className="absolute bottom-0.5 left-0.5 px-1 rounded bg-black/70 text-[9px] text-white">{badge}</span>
+        <span className="absolute top-0.5 left-0.5 px-1 rounded bg-black/70 text-[9px] text-white group-hover:hidden">{badge}</span>
       )}
       <button
         onClick={onClear}
@@ -487,31 +863,54 @@ function Thumb({ path, badge, onClear }: { path: string; badge?: string; onClear
       >
         <X size={10} />
       </button>
+      {onMove && moves.length > 0 && (
+        <div className="absolute inset-x-0.5 bottom-0.5 hidden group-hover:flex gap-0.5">
+          {moves.map((to) => (
+            <button
+              key={to}
+              onClick={() => onMove(to)}
+              className="flex-1 min-w-0 px-0.5 py-0.5 rounded bg-black/75 hover:bg-[#6366f1] text-[9px] leading-none text-white truncate"
+              title={to === 'ref' ? 'Move to the reference images' : `Move to the ${to} frame`}
+            >
+              → {SLOT_LABEL[to]}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
 
 function ImageSlot({
-  path, onPick, onDropPath, onClear,
+  slot, path, targets, onPick, onPlace, onClear,
 }: {
+  slot: Slot
   path: string | null
+  /** Every slot the model has */
+  targets: Slot[]
   onPick: () => void
-  onDropPath: (p: string) => void
+  onPlace: (path: string, from: Slot | null, to: Slot) => void
   onClear: () => void
 }) {
   return (
-    <DropZone onDropPath={onDropPath}>
+    <DropZone onDrop={(p, from) => onPlace(p, from, slot)}>
       {path ? (
         <div className="w-full aspect-video">
           <div className="h-full [&>div]:aspect-auto [&>div]:h-full">
-            <Thumb path={path} onClear={onClear} />
+            <Thumb
+              path={path}
+              slot={slot}
+              moves={targets.filter((t) => t !== slot)}
+              onMove={(to) => onPlace(path, slot, to)}
+              onClear={onClear}
+            />
           </div>
         </div>
       ) : (
         <button
           onClick={onPick}
           className="w-full aspect-video rounded-md border border-dashed border-[#2a2a3a] hover:border-[#6366f1] text-[#55556a] hover:text-[#6366f1] flex items-center justify-center transition-all"
-          title="Choose an image (or drag one from the gallery)"
+          title="Choose an image, or drag one here from the gallery or another slot"
         >
           <Plus size={16} />
         </button>

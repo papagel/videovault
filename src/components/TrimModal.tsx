@@ -1,10 +1,10 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { save } from '@tauri-apps/plugin-dialog'
-import { Scissors, X, Play, Pause, RotateCcw, Undo2, Save } from 'lucide-react'
+import { Scissors, X, Play, Pause, RotateCcw, Undo2, Save, Timer, FastForward, ArrowLeftToLine, ArrowRightToLine } from 'lucide-react'
 import { showConfirm } from '@/lib/dialog'
 import { useStore } from '@/store'
-import { formatDuration } from '@/lib/utils'
+import { cn, formatDuration } from '@/lib/utils'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import type { TrimSegment } from '@/types'
 import type { VideoFile } from '@/types'
@@ -12,6 +12,15 @@ import type { VideoFile } from '@/types'
 interface TrimModalProps {
   onClose?: () => void
 }
+
+/** Fit-to-length: how the video gets down to the target duration */
+type FitMode = 'speed' | 'first' | 'last'
+const FIT_MODES: { mode: FitMode; label: string; hint: string; icon: typeof FastForward }[] = [
+  { mode: 'speed', label: 'Speed up', hint: 'Keep everything, played faster', icon: FastForward },
+  { mode: 'first', label: 'Keep first', hint: 'Keep the opening, cut the rest', icon: ArrowLeftToLine },
+  { mode: 'last', label: 'Keep last', hint: 'Keep the ending, cut the start', icon: ArrowRightToLine },
+]
+const DEFAULT_FIT_SECS = 8
 
 /** A region of the video marked for removal */
 type CutRegion = { start: number; end: number }
@@ -57,6 +66,8 @@ export function TrimModal({ onClose }: TrimModalProps) {
   const [currentTime, setCurrentTime] = useState(0)
   const [playing, setPlaying] = useState(false)
   const [cuts, setCuts] = useState<CutRegion[]>([])
+  const [fitSecs, setFitSecs] = useState(DEFAULT_FIT_SECS)
+  const [fitMode, setFitMode] = useState<FitMode | null>(null)
   const [saving, setSaving] = useState(false)
   const [done, setDone] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -72,6 +83,8 @@ export function TrimModal({ onClose }: TrimModalProps) {
       const video = contextMenuVideo ?? videos.find((v) => selectedVideoIds.has(v.id)) ?? null
       setTargetVideo(video)
       setCuts([])
+      setFitMode(null)
+      setFitSecs(DEFAULT_FIT_SECS)
       setDone(null)
       setError(null)
       setCurrentTime(0)
@@ -83,6 +96,28 @@ export function TrimModal({ onClose }: TrimModalProps) {
   const kept = useMemo(() => keepSegments(cuts, duration), [cuts, duration])
   const keptDuration = kept.reduce((s, k) => s + (k.end - k.start), 0)
   const cutDuration = duration - keptDuration
+
+  // Speed-up plays whatever is kept (any manual cuts applied) fast enough to
+  // fill exactly fitSecs
+  const speed = fitMode === 'speed' && fitSecs > 0 ? keptDuration / fitSecs : 1
+  const resultDuration = fitMode === 'speed' ? Math.min(keptDuration, fitSecs) : keptDuration
+  const fitTooShort = fitMode != null && duration > 0 && duration <= fitSecs + 0.05
+
+  /** Choose a fit mode (or re-apply it for a new length): first/last mark the cut */
+  const applyFit = (mode: FitMode | null, secs = fitSecs) => {
+    setFitMode(mode)
+    setDone(null)
+    setError(null)
+    if (mode == null || duration <= secs + 0.05) return
+    if (mode === 'first') setCuts([{ start: secs, end: duration }])
+    else if (mode === 'last') setCuts([{ start: 0, end: duration - secs }])
+    else if (mode === 'speed') setCuts([])
+  }
+
+  // Preview at the output speed
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.playbackRate = Math.min(16, Math.max(0.25, speed))
+  }, [speed, srcVersion, targetVideo])
 
   // ── Preview playback: skip over cut regions ─────────────────────────────
   const handleTimeUpdate = useCallback(() => {
@@ -153,6 +188,7 @@ export function TrimModal({ onClose }: TrimModalProps) {
       if (b - a >= 0.15) {
         // Drag → mark region for removal
         setCuts((prev) => normalizeCuts([...prev, { start: a, end: b }]))
+        setFitMode((m) => (m === 'speed' ? m : null))
         setDone(null)
       } else {
         // Click → seek
@@ -167,6 +203,7 @@ export function TrimModal({ onClose }: TrimModalProps) {
 
   const removeCut = (idx: number) => {
     setCuts((prev) => prev.filter((_, i) => i !== idx))
+    setFitMode((m) => (m === 'speed' ? m : null))
   }
 
   // Drag a cut region's edge to grow/shrink it. The preview seeks to the
@@ -200,6 +237,7 @@ export function TrimModal({ onClose }: TrimModalProps) {
       document.removeEventListener('pointerup', onUp)
       // Resizing may have pushed this cut into a neighbour — merge overlaps
       setCuts((prev) => normalizeCuts(prev))
+      setFitMode((m) => (m === 'speed' ? m : null))
       setDone(null)
     }
     document.addEventListener('pointermove', onMove)
@@ -212,7 +250,15 @@ export function TrimModal({ onClose }: TrimModalProps) {
       setError('Everything is cut — nothing would remain.')
       return false
     }
-    if (cuts.length === 0) {
+    if (fitTooShort) {
+      setError(`This video is already ${formatDuration(duration)}, not longer than ${fitSecs}s.`)
+      return false
+    }
+    if (fitMode === 'speed' && speed > 100) {
+      setError('That would be more than 100× faster. Choose a longer length.')
+      return false
+    }
+    if (cuts.length === 0 && fitMode !== 'speed') {
       setError('Nothing is marked for removal yet. Drag on the timeline to select a portion to cut.')
       return false
     }
@@ -223,8 +269,10 @@ export function TrimModal({ onClose }: TrimModalProps) {
     if (!targetVideo || !validateCuts()) return
 
     const base = targetVideo.filename.replace(/\.[^/.]+$/, '')
+    const suffix = fitMode ? `_${fitSecs}s` : '_trimmed'
+    // Suggest the original's folder, so "keep both" puts the copy beside it
     const outputPath = await save({
-      defaultPath: `${base}_trimmed.mp4`,
+      defaultPath: `${targetVideo.folder}/${base}${suffix}.mp4`,
       filters: [{ name: 'Video', extensions: ['mp4'] }],
     })
     if (!outputPath) return
@@ -240,6 +288,8 @@ export function TrimModal({ onClose }: TrimModalProps) {
           output_filename: outputFilename,
           output_folder: outputFolder,
           segments: kept,
+          speed: fitMode === 'speed' ? speed : null,
+          max_duration: fitMode ? fitSecs : null,
         },
       })
       setDone(`Saved to ${outputPath}`)
@@ -253,8 +303,11 @@ export function TrimModal({ onClose }: TrimModalProps) {
   const handleReplaceOriginal = async () => {
     if (!targetVideo || !validateCuts()) return
 
+    const change = fitMode === 'speed'
+      ? `It will be sped up ${speed.toFixed(2)}× to ${fitSecs}s`
+      : `The cut portions (${formatDuration(cutDuration)}) will be permanently removed`
     const ok = await showConfirm(
-      `Replace "${targetVideo.filename}"?\nThe cut portions (${formatDuration(cutDuration)}) will be permanently removed from the original file.\nThis cannot be undone.`
+      `Replace "${targetVideo.filename}"?\n${change} in the original file.\nThis cannot be undone. Use "Keep both" to save a copy instead.`
     )
     if (!ok) return
 
@@ -264,6 +317,8 @@ export function TrimModal({ onClose }: TrimModalProps) {
       const updated = await invoke<VideoFile>('trim_replace_video', {
         videoId: targetVideo.id,
         segments: kept,
+        speed: fitMode === 'speed' ? speed : null,
+        maxDuration: fitMode ? fitSecs : null,
       })
       updateVideo(updated.id, {
         duration_secs: updated.duration_secs,
@@ -276,6 +331,7 @@ export function TrimModal({ onClose }: TrimModalProps) {
       })
       // Reload the (new) file in the player and clear the cuts — they're applied now
       setCuts([])
+      setFitMode(null)
       setCurrentTime(0)
       setSrcVersion((v) => v + 1)
       setDone('Original file replaced.')
@@ -324,6 +380,52 @@ export function TrimModal({ onClose }: TrimModalProps) {
 
         {/* Transport + timeline */}
         <div className="p-4 space-y-3 flex-shrink-0">
+          {/* Fit to length */}
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="flex items-center gap-1.5 text-xs text-[#8888aa]">
+              <Timer size={13} className="text-[#6366f1]" /> Fit to
+            </span>
+            <label className="flex items-center gap-1 bg-[#111118] border border-[#2a2a3a] focus-within:border-[#6366f1] rounded-lg px-2 py-1">
+              <input
+                type="number"
+                min={0.5}
+                step={0.5}
+                value={fitSecs}
+                onChange={(e) => {
+                  const v = Math.max(0.1, Number(e.target.value) || DEFAULT_FIT_SECS)
+                  setFitSecs(v)
+                  applyFit(fitMode, v)
+                }}
+                className="w-12 bg-transparent text-xs text-[#e8e8f0] outline-none text-center tabular-nums"
+              />
+              <span className="text-xs text-[#55556a]">sec</span>
+            </label>
+            <div className="flex bg-[#111118] border border-[#2a2a3a] rounded-lg p-0.5">
+              {FIT_MODES.map(({ mode, label, hint, icon: Icon }) => (
+                <button
+                  key={mode}
+                  onClick={() => applyFit(fitMode === mode ? null : mode)}
+                  title={hint}
+                  className={cn(
+                    'flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium transition-all',
+                    fitMode === mode ? 'bg-[#6366f1] text-white' : 'text-[#8888aa] hover:text-white'
+                  )}
+                >
+                  <Icon size={12} /> {label}
+                </button>
+              ))}
+            </div>
+            {fitMode && (
+              <span className={cn('text-[11px]', fitTooShort ? 'text-amber-400' : 'text-[#55556a]')}>
+                {fitTooShort
+                  ? `Already ${formatDuration(duration)}, not longer than ${fitSecs}s`
+                  : fitMode === 'speed'
+                    ? `${formatDuration(keptDuration)} → ${fitSecs}s, preview plays at ${speed.toFixed(2)}×`
+                    : fitMode === 'first' ? `Keeps 0:00–${formatDuration(fitSecs)}` : `Keeps the last ${fitSecs}s`}
+              </span>
+            )}
+          </div>
+
           <div className="flex items-center gap-3">
             <button
               onClick={togglePlay}
@@ -344,9 +446,12 @@ export function TrimModal({ onClose }: TrimModalProps) {
             </span>
             <div className="flex-1" />
             <span className="text-xs text-[#8888aa]">
-              Result: <span className="text-[#e8e8f0] font-medium">{formatDuration(keptDuration)}</span>
+              Result: <span className="text-[#e8e8f0] font-medium">{formatDuration(resultDuration)}</span>
               {cutDuration > 0.05 && (
                 <span className="text-red-400/80 ml-2">−{formatDuration(cutDuration)} cut</span>
+              )}
+              {fitMode === 'speed' && speed > 1.001 && (
+                <span className="text-[#6366f1] ml-2">{speed.toFixed(2)}× speed</span>
               )}
             </span>
           </div>
@@ -439,11 +544,11 @@ export function TrimModal({ onClose }: TrimModalProps) {
         {/* Actions */}
         <div className="flex items-center justify-between gap-3 p-4 border-t border-[#2a2a3a] flex-shrink-0">
           <button
-            onClick={() => setCuts([])}
-            disabled={cuts.length === 0}
+            onClick={() => { setCuts([]); setFitMode(null) }}
+            disabled={cuts.length === 0 && !fitMode}
             className="text-xs text-[#8888aa] hover:text-white transition-all disabled:opacity-40"
           >
-            Reset all cuts
+            Reset all
           </button>
           <div className="flex items-center gap-3">
             <button
@@ -454,15 +559,17 @@ export function TrimModal({ onClose }: TrimModalProps) {
             </button>
             <button
               onClick={handleSaveAsNew}
-              disabled={saving || cuts.length === 0}
+              disabled={saving || (cuts.length === 0 && fitMode !== 'speed') || fitTooShort}
+              title="Save the result as a new file and keep the original"
               className="px-4 py-2 text-sm bg-[#2a2a3a] hover:bg-[#3a3a5a] text-white rounded-lg transition-all disabled:opacity-50 flex items-center gap-2"
             >
               <Save size={14} />
-              {saving ? 'Processing…' : 'Save as New File…'}
+              {saving ? 'Processing…' : 'Keep both…'}
             </button>
             <button
               onClick={handleReplaceOriginal}
-              disabled={saving || cuts.length === 0}
+              disabled={saving || (cuts.length === 0 && fitMode !== 'speed') || fitTooShort}
+              title="Overwrite the original file with the result"
               className="px-4 py-2 text-sm bg-[#6366f1] hover:bg-[#7c7ff5] text-white rounded-lg transition-all disabled:opacity-50 flex items-center gap-2"
             >
               <Scissors size={14} />

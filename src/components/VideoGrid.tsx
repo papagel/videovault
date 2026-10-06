@@ -1,5 +1,6 @@
 import { useMemo, useCallback, useState, useEffect, useRef, useDeferredValue } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { X } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '@/store'
 import { VideoCard } from './VideoCard'
@@ -27,6 +28,12 @@ const PAD = 16 // container padding (p-4)
 const GAP = 12
 const CARD_MIN_W = { sm: 144, md: 192, lg: 256 }
 const CARD_H = { sm: 124, md: 204, lg: 236 }
+/** Case- and accent-insensitive first-character match ("É" counts as "e"). */
+function startsWithChar(name: string, ch: string): boolean {
+  const base = (s: string) => s.normalize('NFD').charAt(0).toLowerCase()
+  return base(name.trim()) === base(ch)
+}
+
 const LIST_ROW_H = 56
 const LIST_GAP = 1
 const OVERSCAN_ROWS = 3
@@ -38,7 +45,8 @@ export function VideoGrid() {
     videos,
     view,
     gridSize,
-    activeFolder,
+    activeFolders,
+    letterFilter,
     activeTags,
     tagFilterMode,
     activeCollection,
@@ -58,7 +66,8 @@ export function VideoGrid() {
       videos: s.videos,
       view: s.view,
       gridSize: s.gridSize,
-      activeFolder: s.activeFolder,
+      activeFolders: s.activeFolders,
+      letterFilter: s.letterFilter,
       activeTags: s.activeTags,
       tagFilterMode: s.tagFilterMode,
       activeCollection: s.activeCollection,
@@ -117,10 +126,14 @@ export function VideoGrid() {
       source = source.filter((v) => !pendingDeleteIds.has(v.id))
     }
 
-    if (activeFolder) {
-      source = source.filter(
-        (v) => v.folder === activeFolder || v.folder.startsWith(activeFolder + '/')
+    if (activeFolders.length > 0) {
+      source = source.filter((v) =>
+        activeFolders.some((f) => v.folder === f || v.folder.startsWith(f + '/'))
       )
+    }
+
+    if (letterFilter) {
+      source = source.filter((v) => startsWithChar(v.filename, letterFilter))
     }
 
     if (activeTags.length > 0) {
@@ -161,7 +174,7 @@ export function VideoGrid() {
       }
       return sortDir === 'asc' ? cmp : -cmp
     })
-  }, [videos, collectionVideos, activeFolder, activeTags, tagFilterMode, searchQuery, sortField, sortDir, activeCollection, pendingDeleteIds])
+  }, [videos, collectionVideos, activeFolders, letterFilter, activeTags, tagFilterMode, searchQuery, sortField, sortDir, activeCollection, pendingDeleteIds])
 
   // Filter changes commit instantly (sidebar highlight); the card window
   // re-renders at background priority.
@@ -614,6 +627,26 @@ export function VideoGrid() {
               />
             </div>
           </div>
+        </div>
+      )}
+
+      {letterFilter && (
+        <div className="mx-4 mt-3 flex items-center gap-2 flex-shrink-0 text-xs">
+          <span className="flex items-center gap-2 pl-1 pr-2 py-1 rounded-lg bg-[#6366f1]/10 border border-[#6366f1]/40 text-[#e8e8f0]">
+            <span className="w-6 h-6 rounded-md bg-[#6366f1] text-white font-semibold flex items-center justify-center uppercase">
+              {letterFilter}
+            </span>
+            Names starting with “{letterFilter.toUpperCase()}”
+            <span className="text-[#8888aa] tabular-nums">· {filteredVideos.length}</span>
+          </span>
+          <span className="text-[#55556a]">Type another letter to switch · Esc to show all (selection is kept)</span>
+          <button
+            onClick={() => useStore.getState().setLetterFilter(null)}
+            className="ml-auto text-[#55556a] hover:text-white"
+            title="Clear (Esc)"
+          >
+            <X size={13} />
+          </button>
         </div>
       )}
 

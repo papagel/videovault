@@ -116,6 +116,7 @@ pub fn run() {
             commands::get_collection_videos,
             commands::check_ffmpeg,
             commands::get_video_stats,
+            commands::reveal_in_finder,
             mage_commands::mage_get_config,
             mage_commands::mage_set_api_key,
             mage_commands::mage_remove_api_key,
@@ -132,6 +133,13 @@ pub fn run() {
             mage_commands::mage_create_character,
             mage_commands::mage_create_reference,
             mage_commands::mage_delete_entity,
+            mage_commands::mage_update_entity,
+            mage_commands::mage_estimate_cost,
+            mage_commands::mage_set_add_to_library,
+            mage_commands::mage_set_entity_intro,
+            mage_commands::mage_clear_entity_intro,
+            commands::probe_media,
+            commands::index_video_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

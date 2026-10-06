@@ -130,3 +130,59 @@ export function shortTime(iso: string): string {
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
   return d.toLocaleDateString()
 }
+
+// ── Mentions ────────────────────────────────────────────────────────────────
+
+const MENTION_RE = /(^|[^\w@])@([a-z][a-z0-9_-]{0,14})(?![a-z0-9_-])/gi
+
+/** Lowercased @handles in a prompt, in order of first mention. */
+export function mentionedHandles(prompt: string): string[] {
+  return [...new Set([...prompt.matchAll(MENTION_RE)].map((m) => m[2].toLowerCase()))]
+}
+
+function mentionRe(handle: string) {
+  return new RegExp(`(^|[^\\w@])@${handle.replace(/[-]/g, '\\-')}(?![a-z0-9_-])`, 'gi')
+}
+
+/** Take every @handle mention out of a prompt, tidying the space it leaves. */
+export function removeMention(prompt: string, handle: string): string {
+  return prompt
+    .replace(mentionRe(handle), '$1')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/ +([,.;:!?])/g, '$1')
+    .replace(/^ +/gm, '')
+}
+
+export function renameMention(prompt: string, from: string, to: string): string {
+  return prompt.replace(mentionRe(from), `$1@${to}`)
+}
+
+// ── Output size ─────────────────────────────────────────────────────────────
+
+/** "16:9" → [16, 9]; tokens like "auto" → null. */
+export function parseRatio(token: string): [number, number] | null {
+  const m = /^(\d+(?:\.\d+)?)\s*[:x]\s*(\d+(?:\.\d+)?)$/i.exec(token)
+  return m ? [Number(m[1]), Number(m[2])] : null
+}
+
+/**
+ * Approximate pixel size for a ratio and resolution token: "720p" fixes the
+ * short side, "2K" an area of about 2048². Models round differently, so this
+ * is shown as approximate unless a past result had the same settings.
+ */
+export function approxSize(ratio: string, resolution?: string): { w: number; h: number } | null {
+  const r = parseRatio(ratio)
+  if (!r) return null
+  const [rw, rh] = r
+  const p = resolution && /^(\d+)p$/i.exec(resolution)
+  if (p) {
+    const short = Number(p[1])
+    const long = Math.round((short * Math.max(rw, rh)) / Math.min(rw, rh) / 2) * 2
+    return rw >= rh ? { w: long, h: short } : { w: short, h: long }
+  }
+  const k = resolution && /^(\d+(?:\.\d+)?)K$/i.exec(resolution)
+  const side = k ? Number(k[1]) * 1024 : 1024
+  const w = Math.round(Math.sqrt((side * side * rw) / rh) / 16) * 16
+  const h = Math.round((w * rh) / rw / 16) * 16
+  return { w, h }
+}

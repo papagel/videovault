@@ -1,0 +1,8 @@
+# Sign dev builds with a stable local certificate before running them, so the
+# Keychain doesn't ask for the Mage key again after every rebuild.
+# See scripts/dev-sign-run.sh.
+[target.aarch64-apple-darwin]
+runner = "scripts/dev-sign-run.sh"
+
+[target.x86_64-apple-darwin]
+runner = "scripts/dev-sign-run.sh"

@@ -117,8 +117,13 @@ pub fn probe_video(path: &str) -> Result<VideoMetadata> {
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
 
-    let width = video_stream["width"].as_u64().unwrap_or(0) as u32;
-    let height = video_stream["height"].as_u64().unwrap_or(0) as u32;
+    let mut width = video_stream["width"].as_u64().unwrap_or(0) as u32;
+    let mut height = video_stream["height"].as_u64().unwrap_or(0) as u32;
+    // Phone videos store landscape frames plus a rotation; report the size
+    // as displayed, so portrait clips count as portrait
+    if rotation_degrees(video_stream).rem_euclid(180) == 90 {
+        std::mem::swap(&mut width, &mut height);
+    }
 
     let fps = parse_fps(video_stream["r_frame_rate"].as_str().unwrap_or("0/1"));
 
@@ -141,6 +146,16 @@ pub fn probe_video(path: &str) -> Result<VideoMetadata> {
         size_bytes,
         has_audio,
     })
+}
+
+/// Display rotation of a video stream, from its display matrix or the older
+/// `rotate` tag.
+fn rotation_degrees(stream: &serde_json::Value) -> i64 {
+    let from_side_data = stream["side_data_list"]
+        .as_array()
+        .and_then(|list| list.iter().find_map(|d| d["rotation"].as_f64()));
+    let from_tag = stream["tags"]["rotate"].as_str().and_then(|s| s.parse::<f64>().ok());
+    from_side_data.or(from_tag).unwrap_or(0.0).round() as i64
 }
 
 fn parse_fps(s: &str) -> f64 {
@@ -184,11 +199,56 @@ pub struct MergeInput {
     pub path: String,
     /// Seconds trimmed off the start of this clip before concatenation
     pub start_offset_secs: f64,
+    /// Seconds kept after the offset; `None` keeps the rest
+    pub duration_secs: Option<f64>,
+}
+
+/// Concatenate the inputs, each from its offset for its duration. With
+/// `max_total_secs`, the output is cut to exactly that length.
+/// Output quality of a merge
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeQuality {
+    /// Visually close to the source (crf 18)
+    #[default]
+    High,
+    /// Smaller files: up to 1080p, crf 24
+    Small,
+}
+
+/// The merged frame: the largest input's size and orientation (even sides),
+/// with "small" capping the short side at 1080. Falls back to 1280×720.
+fn merge_canvas(metadata: &[VideoMetadata], quality: MergeQuality) -> (u32, u32) {
+    let (mut w, mut h) = metadata
+        .iter()
+        .filter(|m| m.width > 0 && m.height > 0)
+        .max_by_key(|m| m.width as u64 * m.height as u64)
+        .map(|m| (m.width as f64, m.height as f64))
+        .unwrap_or((1280.0, 720.0));
+    if quality == MergeQuality::Small {
+        let scale = (1080.0 / w.min(h)).min(1.0);
+        w *= scale;
+        h *= scale;
+    }
+    let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(2);
+    (even(w), even(h))
+}
+
+/// The merged frame rate: the highest input rate, capped at 60 (30 if unknown).
+fn merge_fps(metadata: &[VideoMetadata]) -> f64 {
+    let fps = metadata
+        .iter()
+        .map(|m| m.fps)
+        .filter(|f| *f >= 1.0 && *f <= 240.0)
+        .fold(0.0_f64, f64::max);
+    if fps == 0.0 { 30.0 } else { fps.min(60.0) }
 }
 
 pub fn merge_videos(
     inputs: &[MergeInput],
     output_path: &str,
+    max_total_secs: Option<f64>,
+    quality: MergeQuality,
     on_progress: impl Fn(f64),
 ) -> Result<()> {
     if inputs.is_empty() {
@@ -211,18 +271,34 @@ pub fn merge_videos(
     let effective_durations: Vec<f64> = metadata
         .iter()
         .zip(inputs)
-        .map(|(m, inp)| (m.duration_secs - inp.start_offset_secs).max(0.0))
+        .map(|(m, inp)| {
+            let rest = (m.duration_secs - inp.start_offset_secs).max(0.0);
+            inp.duration_secs.map_or(rest, |d| d.min(rest))
+        })
         .collect();
 
-    let total_duration: f64 = effective_durations.iter().sum();
+    let total_duration: f64 = {
+        let sum: f64 = effective_durations.iter().sum();
+        max_total_secs.map_or(sum, |cap| cap.min(sum))
+    };
+
+    let (cw, ch) = merge_canvas(&metadata, quality);
+    let fps = format!("{:.3}", merge_fps(&metadata));
 
     // Build input args. `-ss` BEFORE `-i` performs fast input-level seeking,
     // so the trimmed head is never decoded.
-    let mut args: Vec<String> = vec!["-y".into()];
+    // Only errors on stderr: progress comes on stdout, and a chatty stderr
+    // that nobody reads until the end could fill its pipe and stall FFmpeg
+    let mut args: Vec<String> = vec!["-y".into(), "-nostats".into(), "-loglevel".into(), "error".into()];
     for inp in inputs {
         if inp.start_offset_secs > 0.0 {
             args.push("-ss".into());
             args.push(format!("{}", inp.start_offset_secs));
+        }
+        // `-t` before `-i` reads only that much of the input
+        if let Some(d) = inp.duration_secs {
+            args.push("-t".into());
+            args.push(format!("{}", d));
         }
         args.push("-i".into());
         args.push(inp.path.clone());
@@ -238,12 +314,13 @@ pub fn merge_videos(
         let v_label = format!("[v{i}]");
         let a_label = format!("[a{i}]");
 
-        // Normalize video: scale to 1280x720 with padding to keep aspect ratio,
-        // set constant frame rate — ensures all inputs are compatible.
+        // Fit every clip to the common frame (largest input's size and
+        // orientation), padding the rest, at one frame rate — concat needs
+        // matching streams. A clip already that size passes through unscaled.
         filter_parts.push(format!(
-            "[{i}:v]scale=1280:720:force_original_aspect_ratio=decrease,\
-             pad=1280:720:(ow-iw)/2:(oh-ih)/2,\
-             fps=30,setsar=1{v_label}"
+            "[{i}:v]scale={cw}:{ch}:force_original_aspect_ratio=decrease:flags=lanczos,\
+             pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2,\
+             fps={fps},setsar=1,format=yuv420p{v_label}"
         ));
 
         if meta.has_audio {
@@ -273,14 +350,18 @@ pub fn merge_videos(
         "-map".into(), "[outv]".into(),
         "-map".into(), "[outa]".into(),
         "-c:v".into(), "libx264".into(),
-        "-crf".into(), "23".into(),
-        "-preset".into(), "fast".into(),
+        "-crf".into(), (if quality == MergeQuality::High { "18" } else { "24" }).into(),
+        "-preset".into(), (if quality == MergeQuality::High { "medium" } else { "fast" }).into(),
+        "-pix_fmt".into(), "yuv420p".into(),
         "-c:a".into(), "aac".into(),
         "-b:a".into(), "192k".into(),
         "-movflags".into(), "+faststart".into(),
         "-progress".into(), "pipe:1".into(),
-        output_path.into(),
     ]);
+    if let Some(cap) = max_total_secs {
+        args.extend(["-t".into(), format!("{}", cap)]);
+    }
+    args.push(output_path.into());
 
     let mut child = std::process::Command::new(ffmpeg_bin())
         .args(&args)
@@ -326,16 +407,24 @@ pub fn merge_videos(
 /// Always re-encodes for frame-accurate cuts (stream-copy can only cut on
 /// keyframes, which shifts cut points by up to several seconds).
 /// Handles inputs without an audio stream.
+///
+/// `speed` above 1 plays the kept footage faster (video and audio, pitch kept)
+/// at the source frame rate; `max_duration` cuts the output to that length.
 pub fn trim_video(
     input_path: &str,
     output_path: &str,
     segments: &[TrimSegment],
+    speed: Option<f64>,
+    max_duration: Option<f64>,
 ) -> Result<()> {
     if segments.is_empty() {
         return Err(anyhow!("No segments provided"));
     }
 
-    let has_audio = probe_video(input_path).map(|m| m.has_audio).unwrap_or(false);
+    let meta = probe_video(input_path).ok();
+    let has_audio = meta.as_ref().map(|m| m.has_audio).unwrap_or(false);
+    let fps = meta.as_ref().map(|m| m.fps).filter(|f| *f > 0.0).unwrap_or(30.0);
+    let speed = speed.filter(|s| (*s - 1.0).abs() > 0.001 && *s > 0.0);
     let n = segments.len();
 
     let mut filter_parts = Vec::new();
@@ -357,16 +446,22 @@ pub fn trim_video(
         }
     }
 
+    // Speed-up after the concat: retime video (keeping the source frame
+    // rate, so frames are dropped rather than the rate inflated) and audio.
+    let (v_post, a_post) = match speed {
+        Some(s) => (format!("setpts=PTS/{s},fps={fps}"), atempo_chain(s)),
+        None => ("null".to_string(), "anull".to_string()),
+    };
     let filter = if has_audio {
         format!(
-            "{};{}concat=n={}:v=1:a=1[outv][outa]",
+            "{};{}concat=n={}:v=1:a=1[cv][ca];[cv]{v_post}[outv];[ca]{a_post}[outa]",
             filter_parts.join(";"),
             concat_inputs,
             n
         )
     } else {
         format!(
-            "{};{}concat=n={}:v=1:a=0[outv]",
+            "{};{}concat=n={}:v=1:a=0[cv];[cv]{v_post}[outv]",
             filter_parts.join(";"),
             concat_inputs,
             n
@@ -388,8 +483,11 @@ pub fn trim_video(
         "-crf".into(), "20".into(),
         "-preset".into(), "fast".into(),
         "-movflags".into(), "+faststart".into(),
-        output_path.into(),
     ]);
+    if let Some(d) = max_duration.filter(|d| *d > 0.0) {
+        args.extend(["-t".into(), format!("{}", d)]);
+    }
+    args.push(output_path.into());
 
     let output = Command::new(ffmpeg_bin()).args(&args).output()?;
     if !output.status.success() {
@@ -402,6 +500,23 @@ pub fn trim_video(
     }
 
     Ok(())
+}
+
+/// `atempo` steps for a speed factor: each step stays within 0.5–2.0, which
+/// every FFmpeg version accepts.
+fn atempo_chain(speed: f64) -> String {
+    let mut rest = speed;
+    let mut steps = Vec::new();
+    while rest > 2.0 {
+        steps.push("atempo=2.0".to_string());
+        rest /= 2.0;
+    }
+    while rest < 0.5 {
+        steps.push("atempo=0.5".to_string());
+        rest /= 0.5;
+    }
+    steps.push(format!("atempo={rest}"));
+    steps.join(",")
 }
 
 pub fn is_ffmpeg_available() -> bool {
@@ -425,4 +540,49 @@ pub fn get_ffmpeg_path() -> Option<String> {
         return Some("ffmpeg".to_string());
     }
     None
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn make(args: &[&str]) {
+        let ok = Command::new(ffmpeg_bin()).args(["-v", "error", "-y"]).args(args).status().unwrap();
+        assert!(ok.success());
+    }
+
+    /// Needs FFmpeg: `cargo test --lib merge_keeps_source_quality -- --ignored`
+    #[test]
+    #[ignore]
+    fn merge_keeps_source_quality() {
+        let dir = std::env::temp_dir().join(format!("vv-mergeq-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = |n: &str| dir.join(n).to_string_lossy().to_string();
+
+        // Phone-style portrait: 1920×1080 frames shown rotated to 1080×1920, 30 fps
+        make(&["-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30", "-t", "2", "-c:v", "libx264", &p("land.mp4")]);
+        make(&["-display_rotation", "90", "-i", &p("land.mp4"), "-c", "copy", &p("phone.mp4")]);
+        // Landscape 720p at 60 fps with audio
+        make(&["-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=60", "-f", "lavfi", "-i", "sine", "-t", "2",
+               "-c:v", "libx264", "-c:a", "aac", &p("wide.mp4")]);
+
+        let phone = probe_video(&p("phone.mp4")).unwrap();
+        assert_eq!((phone.width, phone.height), (1080, 1920), "rotation read from the display matrix");
+
+        let inputs = [
+            MergeInput { path: p("phone.mp4"), start_offset_secs: 0.0, duration_secs: None },
+            MergeInput { path: p("wide.mp4"), start_offset_secs: 0.0, duration_secs: None },
+        ];
+        merge_videos(&inputs, &p("high.mp4"), None, MergeQuality::High, |_| {}).unwrap();
+        let out = probe_video(&p("high.mp4")).unwrap();
+        assert_eq!((out.width, out.height), (1080, 1920), "largest input's size and orientation");
+        assert!((out.fps - 60.0).abs() < 0.01, "highest frame rate kept, got {}", out.fps);
+
+        merge_videos(&inputs, &p("small.mp4"), None, MergeQuality::Small, |_| {}).unwrap();
+        let small = probe_video(&p("small.mp4")).unwrap();
+        assert_eq!((small.width, small.height), (1080, 1920), "1080 short side is already within the cap");
+        assert!(small.size_bytes < out.size_bytes, "smaller file");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

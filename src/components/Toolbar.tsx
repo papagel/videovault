@@ -1,11 +1,11 @@
-import { invoke } from '@tauri-apps/api/core'
-import { open } from '@tauri-apps/plugin-dialog'
 import { useShallow } from 'zustand/react/shallow'
 import {
-  Grid3X3, List, FolderPlus, Merge,
+  Grid3X3, List, Merge,
   Scissors, Tag, Trash2, SortAsc, SortDesc, ChevronDown,
-  PanelLeftClose, PanelLeft, Library, Sparkles, Gem,
+  PanelLeftClose, PanelLeft, Library, Sparkles, Gem, Loader2, Timer,
 } from 'lucide-react'
+import { FolderPicker } from './FolderPicker'
+import { MIX_SPLITS, mixProblem, quickMix, splitLabel } from '@/lib/merge'
 import { useStore } from '@/store'
 import { cn } from '@/lib/utils'
 import type { SortField } from '@/types'
@@ -18,7 +18,6 @@ export function Toolbar() {
     setSortField, setSortDir,
     setShowMergeModal, setShowTrimModal, setShowTagModal,
     setShowRenameModal,
-    setWatchedFolders, setScanning,
     triggerDelete,
     mode, setMode, mageBalance,
   } = useStore(
@@ -41,24 +40,11 @@ export function Toolbar() {
       setShowTrimModal: s.setShowTrimModal,
       setShowTagModal: s.setShowTagModal,
       setShowRenameModal: s.setShowRenameModal,
-      setWatchedFolders: s.setWatchedFolders,
-      setScanning: s.setScanning,
       triggerDelete: s.triggerDelete,
     }))
   )
 
   const selectedCount = selectedVideoIds.size
-
-  const handleAddFolder = async () => {
-    const selected = await open({ directory: true, multiple: false })
-    if (!selected || typeof selected !== 'string') return
-    await invoke('add_watched_folder', { path: selected })
-    const folders = await invoke<string[]>('get_watched_folders')
-    setWatchedFolders(folders)
-    setScanning(true, { total: 0, processed: 0, current_file: 'Scanning...' })
-    // Fire-and-forget: videos stream in via video-found events; scan-complete clears the state
-    invoke('scan_folder_background', { folderPath: selected }).catch(console.error)
-  }
 
   const handleDeleteSelected = () => {
     const ids = [...selectedVideoIds]
@@ -127,6 +113,11 @@ export function Toolbar() {
 
       <div className="w-px h-5 bg-[#2a2a3a] mx-1" />
 
+      {/* Folders being shown, and the picker that adds library folders */}
+      <FolderPicker />
+
+      <div className="w-px h-5 bg-[#2a2a3a] mx-1" />
+
       {/* Sort */}
       <div className="relative group">
         <button className="flex items-center gap-1.5 text-xs text-[#8888aa] hover:text-white bg-[#16161f] border border-[#2a2a3a] rounded-lg px-2.5 py-1.5 transition-all">
@@ -165,6 +156,8 @@ export function Toolbar() {
       <div className="flex-1" />
 
       {/* Selection actions */}
+      <QuickMixStatus />
+
       {selectedCount > 0 && (
         <div className="flex items-center gap-1 bg-[#1e1e2a] border border-[#2a2a3a] rounded-lg px-2 py-1">
           <button
@@ -177,6 +170,7 @@ export function Toolbar() {
           {selectedCount >= 2 && (
             <ToolbarActionButton onClick={() => setShowMergeModal(true)} title="Merge" icon={<Merge size={13} />} />
           )}
+          {selectedCount === 2 && <QuickMix />}
           {selectedCount === 1 && (
             <ToolbarActionButton onClick={() => setShowTrimModal(true)} title="Trim" icon={<Scissors size={13} />} />
           )}
@@ -185,15 +179,6 @@ export function Toolbar() {
           <ToolbarActionButton onClick={handleDeleteSelected} title="Delete" icon={<Trash2 size={13} />} danger />
         </div>
       )}
-
-      {/* Add folder */}
-      <button
-        onClick={handleAddFolder}
-        className="flex items-center gap-1.5 text-xs text-[#8888aa] hover:text-white bg-[#16161f] border border-[#2a2a3a] hover:border-[#3a3a5a] rounded-lg px-2.5 py-1.5 transition-all"
-      >
-        <FolderPlus size={13} />
-        <span>Add Folder</span>
-      </button>
 
       {/* View toggle */}
       <div className="flex items-center bg-[#16161f] border border-[#2a2a3a] rounded-lg p-0.5">
@@ -264,5 +249,74 @@ function ToolbarActionButton({
     >
       {icon}
     </button>
+  )
+}
+
+/**
+ * One-click 8-second mixes for exactly two selected videos, using the merge
+ * templates. Alt-click keeps the longer video's start instead of its end.
+ * The result opens in the player as soon as it's written.
+ */
+function QuickMix() {
+  const selected = useStore(useShallow((s) => s.videos.filter((v) => s.selectedVideoIds.has(v.id))))
+  const busy = useStore((s) => s.quickMixStatus?.progress != null)
+  if (selected.length !== 2) return null
+  const [a, b] = selected
+
+  const run = async (splitIdx: number, keepStart: boolean) => {
+    const s = useStore.getState()
+    s.setQuickMixStatus({ progress: 0 })
+    // Unselect right away; the two videos are already captured above
+    s.clearSelection()
+    try {
+      const video = await quickMix(a, b, MIX_SPLITS[splitIdx], keepStart ? 'start' : 'end', (progress) =>
+        useStore.getState().setQuickMixStatus({ progress })
+      )
+      useStore.getState().setQuickMixStatus(null)
+      useStore.getState().playVideo(video, [video], { selectOnClose: false })
+    } catch (e) {
+      useStore.getState().setQuickMixStatus({ error: String(e) })
+      setTimeout(() => {
+        if (useStore.getState().quickMixStatus?.error) useStore.getState().setQuickMixStatus(null)
+      }, 8000)
+    }
+  }
+
+  return (
+    <span className="flex items-center gap-0.5 pl-1 ml-0.5 border-l border-[#2a2a3a]">
+      <span title="8-second mix" className="flex"><Timer size={12} className="text-[#55556a]" /></span>
+      {MIX_SPLITS.map((split, i) => {
+        const problem = mixProblem(a, b, split)
+        return (
+          <button
+            key={i}
+            onClick={(e) => run(i, e.altKey)}
+            disabled={!!problem || busy}
+            title={problem ?? `8-second mix: ${split.small}s of the shorter video, then the last ${split.big}s of the longer one, then play it. Alt-click keeps the longer one's first ${split.big}s.`}
+            className="px-1.5 py-1 rounded text-[10px] font-medium tabular-nums text-[#8888aa] hover:text-white hover:bg-[#2a2a3a] disabled:opacity-30 disabled:hover:bg-transparent transition-all"
+          >
+            {splitLabel(split)}
+          </button>
+        )
+      })}
+    </span>
+  )
+}
+
+/** Progress or failure of a one-click mix (shown even after the selection clears) */
+function QuickMixStatus() {
+  const status = useStore((s) => s.quickMixStatus)
+  if (!status) return null
+  if (status.error) {
+    return (
+      <span className="text-[11px] text-red-400 max-w-[220px] truncate" title={status.error}>
+        8s mix failed: {status.error}
+      </span>
+    )
+  }
+  return (
+    <span className="flex items-center gap-1.5 text-[11px] text-[#8888aa] tabular-nums">
+      <Loader2 size={12} className="animate-spin text-[#6366f1]" /> 8s mix {Math.round((status.progress ?? 0) * 100)}%
+    </span>
   )
 }

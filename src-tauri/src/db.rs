@@ -119,6 +119,18 @@ fn create_tables(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL
         );
 
+        -- A local intro video per character/reference (never sent to Mage).
+        -- Separate from mage_entities, which a sync rewrites.
+        CREATE TABLE IF NOT EXISTS mage_entity_intros (
+            entity_id TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            duration_secs REAL NOT NULL DEFAULT 0,
+            width INTEGER NOT NULL DEFAULT 0,
+            height INTEGER NOT NULL DEFAULT 0,
+            thumbnail_path TEXT,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_mage_generations_created ON mage_generations(created_at);
         CREATE INDEX IF NOT EXISTS idx_videos_folder ON videos(folder);
         CREATE INDEX IF NOT EXISTS idx_videos_deleted ON videos(is_deleted);

@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import {
   Play, Scissors, Merge, Tag, Trash2, FolderOpen,
-  FileText, PlusSquare, Check, Search,
+  FileText, PlusSquare, Check, Search, Film,
 } from 'lucide-react'
 import { showPrompt } from '@/lib/dialog'
 import { useStore } from '@/store'
@@ -109,8 +109,7 @@ export function ContextMenu({ video, x, y, onClose }: ContextMenuProps) {
   }
 
   const handleReveal = () => {
-    // Open in Finder
-    invoke('plugin:shell|open', { path: video.folder }).catch(console.error)
+    invoke('reveal_in_finder', { path: video.path }).catch(console.error)
     onClose()
   }
 
@@ -199,6 +198,16 @@ export function ContextMenu({ video, x, y, onClose }: ContextMenuProps) {
           }}
         />
       )}
+
+      <MenuItem
+        icon={<Film size={13} />}
+        label="Merge with intro…"
+        title="Put a character's intro on top of this video (8-second mix)"
+        onClick={() => {
+          useStore.getState().setIntroPickVideo({ video, preferHandles: [] })
+          onClose()
+        }}
+      />
 
       <MenuItem
         icon={<Tag size={13} />}

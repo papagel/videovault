@@ -2,29 +2,50 @@ import { useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import {
   Loader2, AlertTriangle, Ban, RotateCcw, Shuffle, FolderOpen, Trash2,
-  ImagePlus, Clapperboard, UserPlus, Gem, X, Square, Play,
+  ImagePlus, Clapperboard, UserPlus, Gem, X, Square, Play, Crop, Maximize2, Search, Film,
 } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '@/store'
 import { showConfirm } from '@/lib/dialog'
 import { cn, getThumbnailSrc, getVideoSrc } from '@/lib/utils'
-import { FINAL_STATUSES, isRetryable, remixGeneration, shortTime, statusLabel } from '@/lib/mage'
+import { FINAL_STATUSES, isRetryable, mentionedHandles, remixGeneration, shortTime, statusLabel } from '@/lib/mage'
+import { videoForGeneration } from '@/lib/intro'
 import { DRAG_MIME } from './StudioPanel'
-import type { MageGeneration } from '@/types'
+import type { MageGeneration, MageThumbSize } from '@/types'
 
 type Filter = 'all' | 'image' | 'video'
 
+/** Minimum card width per thumbnail size; cards stretch to fill the row. */
+const THUMB_WIDTH: Record<MageThumbSize, number> = { xs: 120, sm: 160, md: 210, lg: 290, xl: 400 }
+const THUMB_SIZES = Object.keys(THUMB_WIDTH) as MageThumbSize[]
+
 export function GenerationGallery() {
-  const { generations, mageConfig } = useStore(
-    useShallow((s) => ({ generations: s.mageGenerations, mageConfig: s.mageConfig }))
+  const { generations, mageConfig, thumbSize, thumbFit, updateSettings } = useStore(
+    useShallow((s) => ({
+      generations: s.mageGenerations,
+      mageConfig: s.mageConfig,
+      thumbSize: s.settings.mageThumbSize,
+      thumbFit: s.settings.mageThumbFit,
+      updateSettings: s.updateSettings,
+    }))
   )
+  const architectures = useStore((s) => s.mageArchitectures)
   const [filter, setFilter] = useState<Filter>('all')
+  const [query, setQuery] = useState('')
   const [viewing, setViewing] = useState<MageGeneration | null>(null)
 
-  const shown = useMemo(
-    () => generations.filter((g) => filter === 'all' || g.media_type === filter),
-    [generations, filter]
-  )
+  const shown = useMemo(() => {
+    const words = query.toLowerCase().split(/\s+/).filter(Boolean)
+    const names = new Map(architectures.map((a) => [a.id, a.name]))
+    return generations.filter((g) => {
+      if (filter !== 'all' && g.media_type !== filter) return false
+      if (words.length === 0) return true
+      // Every word must match the prompt, model or status
+      const text = [g.prompt, names.get(g.architecture), g.architecture, g.model_id, g.status]
+        .filter(Boolean).join(' ').toLowerCase()
+      return words.every((w) => text.includes(w))
+    })
+  }, [generations, filter, query, architectures])
   const anyRunning = generations.some((g) => !FINAL_STATUSES.has(g.status))
   const now = useTick(anyRunning)
 
@@ -45,11 +66,38 @@ export function GenerationGallery() {
             </button>
           ))}
         </div>
+        <SearchBox
+          value={query}
+          onChange={setQuery}
+          placeholder={filter === 'image' ? 'Search images' : filter === 'video' ? 'Search videos' : 'Search prompts, models'}
+          className="w-44"
+        />
         <span className="text-[11px] text-[#55556a] tabular-nums">{shown.length}</span>
         <div className="flex-1" />
+        <button
+          onClick={() => updateSettings({ mageThumbFit: thumbFit === 'cover' ? 'contain' : 'cover' })}
+          className="p-1.5 rounded-lg border border-[#2a2a3a] bg-[#16161f] text-[#8888aa] hover:text-white"
+          title={thumbFit === 'cover' ? 'Cropped to squares. Click to show whole frames' : 'Whole frames. Click to crop to squares'}
+        >
+          {thumbFit === 'cover' ? <Crop size={12} /> : <Maximize2 size={12} />}
+        </button>
+        <div className="flex items-center bg-[#16161f] border border-[#2a2a3a] rounded-lg p-0.5" title="Thumbnail size">
+          {THUMB_SIZES.map((s) => (
+            <button
+              key={s}
+              onClick={() => updateSettings({ mageThumbSize: s })}
+              className={cn(
+                'px-2 py-1 rounded text-[10px] font-medium transition-all',
+                thumbSize === s ? 'bg-[#2a2a3a] text-white' : 'text-[#55556a] hover:text-[#8888aa]'
+              )}
+            >
+              {s.toUpperCase()}
+            </button>
+          ))}
+        </div>
         {mageConfig?.output_dir && (
           <button
-            onClick={() => invoke('plugin:shell|open', { path: mageConfig.output_dir }).catch(console.error)}
+            onClick={() => invoke('reveal_in_finder', { path: mageConfig.output_dir }).catch(console.error)}
             className="flex items-center gap-1.5 text-[11px] text-[#8888aa] hover:text-white"
             title={mageConfig.output_dir}
           >
@@ -61,13 +109,28 @@ export function GenerationGallery() {
       <div className="flex-1 overflow-y-auto p-4">
         {shown.length === 0 ? (
           <div className="h-full flex items-center justify-center text-center text-xs text-[#55556a] max-w-xs mx-auto">
-            Your generations appear here. Finished files are saved to your Mage folder, and videos are
-            added to the library, tagged “Mage”.
+            {query ? (
+              <span>
+                Nothing matches “{query}”.{' '}
+                <button onClick={() => setQuery('')} className="text-[#6366f1] hover:text-[#7c7ff5]">Clear search</button>
+              </span>
+            ) : <>Your generations appear here. Finished files are saved to your Mage folder, and videos are
+            added to the library, tagged “Mage”.</>}
           </div>
         ) : (
-          <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))' }}>
+          <div
+            className={cn('grid', thumbSize === 'xs' ? 'gap-2' : 'gap-3')}
+            style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${THUMB_WIDTH[thumbSize] ?? 210}px, 1fr))` }}
+          >
             {shown.map((g) => (
-              <GenerationCard key={g.id} g={g} now={now} onOpen={() => setViewing(g)} />
+              <GenerationCard
+                key={g.id}
+                g={g}
+                now={now}
+                fit={thumbFit}
+                compact={thumbSize === 'xs'}
+                onOpen={() => setViewing(g)}
+              />
             ))}
           </div>
         )}
@@ -94,9 +157,19 @@ function elapsed(from: string, now: number) {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`
 }
 
-function GenerationCard({ g, now, onOpen }: { g: MageGeneration; now: number; onOpen: () => void }) {
-  const { architectures, updateDraft, remove, setEntityModal } = useStore(
+function GenerationCard({
+  g, now, fit, compact, onOpen,
+}: {
+  g: MageGeneration
+  now: number
+  fit: 'cover' | 'contain'
+  /** Smallest size: no caption, so more fit on screen */
+  compact: boolean
+  onOpen: () => void
+}) {
+  const { architectures, updateDraft, remove, setEntityModal, trashOnRemove } = useStore(
     useShallow((s) => ({
+      trashOnRemove: s.settings.mageTrashOnRemove,
       architectures: s.mageArchitectures,
       updateDraft: s.updateMageDraft,
       remove: s.removeMageGeneration,
@@ -119,12 +192,12 @@ function GenerationCard({ g, now, onOpen }: { g: MageGeneration; now: number; on
   })
   const retry = act(() => invoke('mage_retry_generation', { id: g.id }))
   const removeFromHistory = act(async () => {
-    await invoke('mage_remove_generation', { id: g.id })
+    const trashFile = useStore.getState().settings.mageTrashOnRemove && !!g.local_path
+    await invoke('mage_remove_generation', { id: g.id, trashFile })
     remove(g.id)
   })
   const reveal = act(async () => {
-    const folder = g.local_path!.split('/').slice(0, -1).join('/')
-    await invoke('plugin:shell|open', { path: folder })
+    await invoke('reveal_in_finder', { path: g.local_path! })
   })
   const remix = act(async () => remixGeneration(g))
   // Read the draft at click time: subscribing every card to it would
@@ -140,6 +213,10 @@ function GenerationCard({ g, now, onOpen }: { g: MageGeneration; now: number; on
       : { mediaType: 'video', architecture: null, config: {}, firstFrame: g.local_path! })
   })
   const makeCharacter = act(async () => setEntityModal({ type: 'character', filePath: g.local_path! }))
+  const mergeWithIntro = act(async () => {
+    const video = await videoForGeneration(g)
+    if (video) useStore.getState().setIntroPickVideo({ video, preferHandles: mentionedHandles(g.prompt) })
+  })
 
   return (
     <div
@@ -156,13 +233,18 @@ function GenerationCard({ g, now, onOpen }: { g: MageGeneration; now: number; on
         className={cn('relative aspect-square bg-[#0d0d14] flex items-center justify-center', done && 'cursor-pointer')}
       >
         {done && isImage && (
-          <img src={getThumbnailSrc(g.local_path)} className="w-full h-full object-cover" alt="" loading="lazy" />
+          <img
+            src={getThumbnailSrc(g.local_path)}
+            className={cn('w-full h-full', fit === 'cover' ? 'object-cover' : 'object-contain')}
+            alt=""
+            loading="lazy"
+          />
         )}
         {done && !isImage && (
           <>
             <video
               src={`${getVideoSrc(g.local_path!)}#t=0.1`}
-              className="w-full h-full object-cover"
+              className={cn('w-full h-full', fit === 'cover' ? 'object-cover' : 'object-contain')}
               muted
               loop
               preload="metadata"
@@ -193,19 +275,28 @@ function GenerationCard({ g, now, onOpen }: { g: MageGeneration; now: number; on
         )}
 
         {/* Hover actions */}
-        <div className="absolute top-1.5 right-1.5 hidden group-hover:flex items-center gap-0.5 bg-black/75 rounded-lg p-0.5">
+        <div className="absolute top-1.5 right-1.5 left-1.5 hidden group-hover:flex flex-wrap justify-end items-center gap-0.5">
+          <div className="flex flex-wrap justify-end gap-0.5 bg-black/75 rounded-lg p-0.5">
           {running && g.status !== 'downloading' && <CardAction icon={<Square size={12} />} title="Cancel" onClick={cancel} />}
           {isRetryable(g) && <CardAction icon={<RotateCcw size={12} />} title="Retry" onClick={retry} />}
           {!running && <CardAction icon={<Shuffle size={12} />} title="Remix: load these settings into the Studio" onClick={remix} />}
           {done && isImage && <CardAction icon={<ImagePlus size={12} />} title="Use as reference image" onClick={useAsReference} />}
           {done && isImage && <CardAction icon={<Clapperboard size={12} />} title="Animate: use as a video's first frame" onClick={animate} />}
           {done && isImage && <CardAction icon={<UserPlus size={12} />} title="Save as a Mage character" onClick={makeCharacter} />}
+          {done && !isImage && <CardAction icon={<Film size={12} />} title="Merge with a character's intro on top" onClick={mergeWithIntro} />}
           {done && <CardAction icon={<FolderOpen size={12} />} title="Show in Finder" onClick={reveal} />}
-          {!running && <CardAction icon={<Trash2 size={12} />} title="Remove from history (keeps the file)" onClick={removeFromHistory} />}
+          {!running && (
+            <CardAction
+              icon={<Trash2 size={12} />}
+              title={trashOnRemove && g.local_path ? 'Remove from history and move the file to the Trash' : 'Remove from history (keeps the file)'}
+              onClick={removeFromHistory}
+            />
+          )}
+          </div>
         </div>
       </div>
 
-      <div className="p-2.5 space-y-1.5">
+      <div className={cn('p-2.5 space-y-1.5', compact && 'hidden')}>
         <p className="text-xs text-[#e8e8f0] line-clamp-2 min-h-[2rem]" title={g.prompt}>
           {g.prompt || <span className="text-[#55556a] italic">No prompt</span>}
         </p>
@@ -223,6 +314,39 @@ function GenerationCard({ g, now, onOpen }: { g: MageGeneration; now: number; on
           </span>
         </div>
       </div>
+    </div>
+  )
+}
+
+/** Small search field; Escape clears it. */
+export function SearchBox({
+  value, onChange, placeholder, className,
+}: {
+  value: string
+  onChange: (v: string) => void
+  placeholder: string
+  className?: string
+}) {
+  return (
+    <div className={cn(
+      'flex items-center gap-1.5 h-7 px-2 bg-[#16161f] border border-[#2a2a3a] focus-within:border-[#6366f1] rounded-lg',
+      className
+    )}>
+      <Search size={12} className="flex-shrink-0 text-[#55556a]" />
+      <input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape' && value) { e.stopPropagation(); onChange('') }
+        }}
+        placeholder={placeholder}
+        className="flex-1 min-w-0 bg-transparent text-[11px] text-[#e8e8f0] placeholder-[#55556a] outline-none"
+      />
+      {value && (
+        <button onClick={() => onChange('')} className="text-[#55556a] hover:text-white" title="Clear">
+          <X size={11} />
+        </button>
+      )}
     </div>
   )
 }

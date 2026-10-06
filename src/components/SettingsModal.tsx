@@ -100,8 +100,22 @@ export function SettingsModal() {
 }
 
 /** API key (kept in the Keychain) and the folder generations download to. */
+/** mageConfirmGems: 0 always asks, -1 never does */
+const CONFIRM_OPTIONS = [
+  { value: 0, label: 'Every time' },
+  ...[100, 250, 500, 1000, 2500].map((n) => ({ value: n, label: `At ${n.toLocaleString()}+ gems` })),
+  { value: -1, label: 'Never' },
+]
+
 function MageSettings() {
-  const { mageConfig, setMageConfig, mageBalance, setMageBalance } = useStore()
+  const { mageConfig, setMageConfig, mageBalance, setMageBalance, updateSettings } = useStore()
+  const confirmGems = useStore((s) => s.settings.mageConfirmGems)
+  const trashOnRemove = useStore((s) => s.settings.mageTrashOnRemove)
+
+  const setAddToLibrary = async (enabled: boolean) => {
+    await invoke('mage_set_add_to_library', { enabled }).catch(console.error)
+    if (mageConfig) setMageConfig({ ...mageConfig, add_to_library: enabled })
+  }
   const [key, setKey] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -116,7 +130,7 @@ function MageSettings() {
     try {
       const balance = await invoke<number>('mage_set_api_key', { key })
       setMageBalance(balance)
-      setMageConfig({ ...(mageConfig ?? { output_dir: '' }), has_key: true })
+      setMageConfig({ ...(mageConfig ?? { output_dir: '', add_to_library: true }), has_key: true })
       setKey('')
     } catch (e) {
       setError(String(e))
@@ -195,6 +209,42 @@ function MageSettings() {
         <p className="text-[11px] text-[#55556a]">
           Generations download here; videos are added to the library. Mage deletes results after 30 days, so this copy is the one that lasts.
         </p>
+
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-sm text-[#e8e8f0]">Add generated videos to the library</p>
+            <p className="text-xs text-[#55556a]">
+              {mageConfig?.add_to_library === false
+                ? 'Off: new videos only go to the Mage folder. Ones already in the library stay.'
+                : 'Tagged “Mage” and with each @character they mention'}
+            </p>
+          </div>
+          <Toggle checked={mageConfig?.add_to_library !== false} onChange={setAddToLibrary} />
+        </div>
+
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-sm text-[#e8e8f0]">Remove from history also trashes the file</p>
+            <p className="text-xs text-[#55556a]">
+              {trashOnRemove ? 'The file goes to the Trash and leaves the library' : 'Off: the file stays in the Mage folder'}
+            </p>
+          </div>
+          <Toggle checked={trashOnRemove} onChange={(v) => updateSettings({ mageTrashOnRemove: v })} />
+        </div>
+
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-sm text-[#e8e8f0]">Ask before generating</p>
+            <p className="text-xs text-[#55556a]">Generate goes straight through below this price</p>
+          </div>
+          <select
+            value={confirmGems}
+            onChange={(e) => updateSettings({ mageConfirmGems: Number(e.target.value) })}
+            className="flex-shrink-0 bg-[#111118] border border-[#2a2a3a] focus:border-[#6366f1] rounded-lg px-2 py-1.5 text-xs text-[#e8e8f0] outline-none"
+          >
+            {CONFIRM_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        </div>
       </div>
     </section>
   )
