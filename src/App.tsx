@@ -15,7 +15,10 @@ import { RenameModal } from '@/components/RenameModal'
 import { ContextMenu } from '@/components/ContextMenu'
 import { QuickPreview } from '@/components/QuickPreview'
 import { UndoToast } from '@/components/UndoToast'
-import type { Tag, Collection, ScanProgress } from '@/types'
+import { CreateView } from '@/components/create/CreateView'
+import { EntityModal } from '@/components/create/EntityModal'
+import { refreshMageBalance } from '@/lib/mage'
+import type { Tag, Collection, ScanProgress, MageGeneration } from '@/types'
 
 const AppWrapper = () => {
   // Deliberately NOT subscribing to `videos` or `hoveredVideoId` here: both
@@ -39,8 +42,10 @@ const AppWrapper = () => {
     setShowTrimModal,
     showRenameModal,
     setShowRenameModal,
+    mode,
   } = useStore(
     useShallow((s) => ({
+      mode: s.mode,
       contextMenuVideo: s.contextMenuVideo,
       setContextMenuVideo: s.setContextMenuVideo,
       quickPreviewVideo: s.quickPreviewVideo,
@@ -77,6 +82,9 @@ const AppWrapper = () => {
     let unlistenRemoved: (() => void) | undefined
     let unlistenProgress: (() => void) | undefined
     let unlistenComplete: (() => void) | undefined
+    let unlistenMage: (() => void) | undefined
+    let unlistenTags: (() => void) | undefined
+    let unlistenFolders: (() => void) | undefined
 
     const t = setTimeout(async () => {
       try {
@@ -104,6 +112,29 @@ const AppWrapper = () => {
               .catch(console.error)
           }
         })
+
+        // Mage generations advance in the backend (upload → poll → download)
+        unlistenMage = await listen<MageGeneration>('mage-generation-updated', (e) => {
+          const s = useStore.getState()
+          const prev = s.mageGenerations.find((g) => g.id === e.payload.id)
+          s.upsertMageGeneration(e.payload)
+          // Gems move when Mage accepts, fails or refunds a request
+          if (prev?.status !== e.payload.status && ['in_progress', 'completed', 'failed'].includes(e.payload.status)) {
+            refreshMageBalance()
+          }
+        })
+
+        // Generated videos get "Mage" / "@handle" tags created in the backend
+        unlistenTags = await listen('tags-changed', () => {
+          invoke<Tag[]>('get_all_tags').then((t) => useStore.getState().setTags(t)).catch(console.warn)
+        })
+
+        // The Mage folder joins the library on the first download
+        unlistenFolders = await listen('watched-folders-changed', () => {
+          invoke<string[]>('get_watched_folders')
+            .then((f) => useStore.getState().setWatchedFolders(f))
+            .catch(console.warn)
+        })
       } catch (e) {
         console.warn('Failed to set up event listeners:', e)
       }
@@ -115,6 +146,9 @@ const AppWrapper = () => {
       unlistenRemoved?.()
       unlistenProgress?.()
       unlistenComplete?.()
+      unlistenMage?.()
+      unlistenTags?.()
+      unlistenFolders?.()
     }
   }, [])
 
@@ -192,7 +226,8 @@ const AppWrapper = () => {
       // Space → Quick Preview on hovered video, but only when the player modal is NOT open
       // (when the player is open, Space is handled inside Player.tsx for play/pause)
       const playerModalOpen = !!document.getElementById('video-player-modal')
-      if (e.key === ' ' && !isInput && !playerModalOpen) {
+      const inLibrary = useStore.getState().mode === 'library'
+      if (e.key === ' ' && !isInput && !playerModalOpen && inLibrary) {
         const s = useStore.getState()
         if (s.quickPreviewVideo) return
         e.preventDefault()
@@ -206,7 +241,7 @@ const AppWrapper = () => {
       // Cmd+A / Ctrl+A → select all filtered videos, second press deselects.
       // Uses the store's filtered id list (the virtualized grid only mounts
       // a viewport's worth of cards, so the DOM can't be the source).
-      if ((e.metaKey || e.ctrlKey) && e.key === 'a' && !isInput) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'a' && !isInput && inLibrary) {
         e.preventDefault()
         const { filteredVideoIds, selectedVideoIds, selectByIds, clearSelection } = useStore.getState()
         const allSelected =
@@ -246,14 +281,21 @@ const AppWrapper = () => {
     <div className="flex flex-col h-screen overflow-hidden bg-[#0a0a0f]">
       <Toolbar />
       <div className="flex flex-1 overflow-hidden">
-        <Sidebar />
-        <VideoGrid />
+        {mode === 'create' ? (
+          <CreateView />
+        ) : (
+          <>
+            <Sidebar />
+            <VideoGrid />
+          </>
+        )}
       </div>
       <Player />
 
       <MergeModal />
       <TagModal />
       <SettingsModal />
+      <EntityModal />
       {/* Trim and Rename modals — wrap with clear of contextMenuVideo on close */}
       <TrimModal onClose={() => {
         setShowTrimModal(false)

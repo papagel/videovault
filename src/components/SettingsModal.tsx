@@ -1,8 +1,11 @@
 import { useState, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { Settings, X, Film, HardDrive, Clock } from 'lucide-react'
+import { open } from '@tauri-apps/plugin-dialog'
+import { Settings, X, Film, HardDrive, Clock, KeyRound, Gem, Loader2, ExternalLink } from 'lucide-react'
 import { useStore } from '@/store'
+import { showConfirm } from '@/lib/dialog'
 import { cn, formatDuration, formatFileSize } from '@/lib/utils'
+import type { MageConfig } from '@/types'
 
 export function SettingsModal() {
   const { showSettingsModal, setShowSettingsModal, settings, updateSettings, stats, videos } = useStore()
@@ -64,6 +67,8 @@ export function SettingsModal() {
             </div>
           </section>
 
+          <MageSettings />
+
           {/* Playback */}
           <section>
             <h3 className="text-xs font-semibold text-[#8888aa] uppercase tracking-wider mb-3">Playback</h3>
@@ -91,6 +96,107 @@ export function SettingsModal() {
         </div>
       </div>
     </div>
+  )
+}
+
+/** API key (kept in the Keychain) and the folder generations download to. */
+function MageSettings() {
+  const { mageConfig, setMageConfig, mageBalance, setMageBalance } = useStore()
+  const [key, setKey] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    invoke<MageConfig>('mage_get_config').then(setMageConfig).catch(console.warn)
+  }, [setMageConfig])
+
+  const saveKey = async () => {
+    setSaving(true)
+    setError(null)
+    try {
+      const balance = await invoke<number>('mage_set_api_key', { key })
+      setMageBalance(balance)
+      setMageConfig({ ...(mageConfig ?? { output_dir: '' }), has_key: true })
+      setKey('')
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const removeKey = async () => {
+    if (!await showConfirm('Remove the Mage API key from this Mac?\nRunning generations stop updating until a key is added again.')) return
+    await invoke('mage_remove_api_key').catch(console.error)
+    setMageBalance(null)
+    if (mageConfig) setMageConfig({ ...mageConfig, has_key: false })
+  }
+
+  const changeFolder = async () => {
+    const selected = await open({ directory: true, multiple: false, defaultPath: mageConfig?.output_dir })
+    if (!selected || typeof selected !== 'string') return
+    await invoke('mage_set_output_dir', { path: selected })
+    if (mageConfig) setMageConfig({ ...mageConfig, output_dir: selected })
+  }
+
+  return (
+    <section>
+      <h3 className="text-xs font-semibold text-[#8888aa] uppercase tracking-wider mb-3">Mage</h3>
+      <div className="space-y-3">
+        {mageConfig?.has_key ? (
+          <div className="flex items-center justify-between py-2 border-b border-[#1e1e2a]">
+            <div>
+              <p className="text-sm text-[#e8e8f0] flex items-center gap-1.5"><KeyRound size={13} className="text-green-400" /> API key saved in Keychain</p>
+              {mageBalance != null && (
+                <p className="text-xs text-[#55556a] flex items-center gap-1 mt-0.5"><Gem size={11} /> {Math.floor(mageBalance).toLocaleString()} gems</p>
+              )}
+            </div>
+            <button onClick={removeKey} className="text-xs text-red-400 hover:text-red-300">Remove</button>
+          </div>
+        ) : (
+          <div>
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={key}
+                onChange={(e) => setKey(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && key) saveKey() }}
+                placeholder="mage_sk_…"
+                autoComplete="off"
+                className="flex-1 bg-[#111118] border border-[#2a2a3a] focus:border-[#6366f1] rounded-lg px-3 py-1.5 text-sm text-[#e8e8f0] placeholder-[#55556a] outline-none"
+              />
+              <button
+                onClick={saveKey}
+                disabled={!key || saving}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-[#6366f1] hover:bg-[#7c7ff5] disabled:bg-[#2a2a3a] disabled:text-[#55556a] text-white rounded-lg"
+              >
+                {saving && <Loader2 size={12} className="animate-spin" />} Save
+              </button>
+            </div>
+            <button
+              onClick={() => invoke('plugin:shell|open', { path: 'https://www.mage.space/api?tab=api-keys' }).catch(console.error)}
+              className="mt-1.5 flex items-center gap-1 text-[11px] text-[#6366f1] hover:text-[#7c7ff5]"
+            >
+              Get a key in Mage → API → API Keys <ExternalLink size={10} />
+            </button>
+            {error && <p className="mt-1.5 text-xs text-red-400 break-words">{error}</p>}
+          </div>
+        )}
+
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-sm text-[#e8e8f0]">Mage folder</p>
+            <p className="text-xs text-[#55556a] truncate" title={mageConfig?.output_dir}>
+              {mageConfig?.output_dir ?? '…'}
+            </p>
+          </div>
+          <button onClick={changeFolder} className="flex-shrink-0 text-xs text-[#6366f1] hover:text-[#7c7ff5]">Change…</button>
+        </div>
+        <p className="text-[11px] text-[#55556a]">
+          Generations download here; videos are added to the library. Mage deletes results after 30 days, so this copy is the one that lasts.
+        </p>
+      </div>
+    </section>
   )
 }
 

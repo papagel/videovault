@@ -1,8 +1,11 @@
 mod commands;
 mod db;
 mod ffmpeg;
+mod mage;
+mod mage_commands;
 
 use commands::{DbState, ThumbDirState, WatcherState};
+use mage_commands::MageKeyState;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::sync::Mutex;
 use tauri::Manager;
@@ -74,6 +77,10 @@ pub fn run() {
             }
 
             app.manage(watcher_state);
+            app.manage(MageKeyState(Mutex::new(None)));
+
+            // Resume Mage generations that were in flight when the app quit
+            mage_commands::resume_pending(app.handle().clone());
 
             Ok(())
         })
@@ -109,6 +116,22 @@ pub fn run() {
             commands::get_collection_videos,
             commands::check_ffmpeg,
             commands::get_video_stats,
+            mage_commands::mage_get_config,
+            mage_commands::mage_set_api_key,
+            mage_commands::mage_remove_api_key,
+            mage_commands::mage_set_output_dir,
+            mage_commands::mage_get_balance,
+            mage_commands::mage_list_architectures,
+            mage_commands::mage_generate,
+            mage_commands::mage_list_generations,
+            mage_commands::mage_cancel_generation,
+            mage_commands::mage_retry_generation,
+            mage_commands::mage_remove_generation,
+            mage_commands::mage_list_entities,
+            mage_commands::mage_sync_entities,
+            mage_commands::mage_create_character,
+            mage_commands::mage_create_reference,
+            mage_commands::mage_delete_entity,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

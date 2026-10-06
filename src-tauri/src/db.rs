@@ -67,6 +67,59 @@ fn create_tables(conn: &Connection) -> Result<()> {
             added_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        -- Mage generations: our own history, since the API has no endpoint
+        -- that lists past requests. config_json is the exact body sent
+        -- (media fields already resolved to Mage URLs), inputs_json the
+        -- local paths per role so a generation can be remixed.
+        CREATE TABLE IF NOT EXISTS mage_generations (
+            id TEXT PRIMARY KEY,
+            request_id TEXT,
+            idempotency_key TEXT NOT NULL,
+            architecture TEXT NOT NULL,
+            model_id TEXT,
+            media_type TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            inputs_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error TEXT,
+            gems_charged REAL,
+            gems_refunded REAL,
+            seed INTEGER,
+            status_url TEXT,
+            cancel_url TEXT,
+            result_url TEXT,
+            result_expires_at TEXT,
+            local_path TEXT,
+            width INTEGER,
+            height INTEGER,
+            video_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        -- Local mirror of Mage characters and references (entity_type =
+        -- 'character' | 'reference'), with the image cached on disk.
+        CREATE TABLE IF NOT EXISTS mage_entities (
+            id TEXT PRIMARY KEY,
+            entity_type TEXT NOT NULL,
+            handle TEXT NOT NULL,
+            name TEXT NOT NULL,
+            kind TEXT,
+            description TEXT,
+            image_url TEXT,
+            audio_url TEXT,
+            local_image_path TEXT,
+            visibility TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mage_generations_created ON mage_generations(created_at);
         CREATE INDEX IF NOT EXISTS idx_videos_folder ON videos(folder);
         CREATE INDEX IF NOT EXISTS idx_videos_deleted ON videos(is_deleted);
         CREATE INDEX IF NOT EXISTS idx_video_tags_video ON video_tags(video_id);
@@ -81,6 +134,24 @@ pub fn get_db_path(app_data_dir: &Path) -> String {
         .join("videovault.db")
         .to_string_lossy()
         .to_string()
+}
+
+pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        params![key],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
 }
 
 pub fn record_play(conn: &Connection, video_id: &str) -> Result<()> {

@@ -1,6 +1,9 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import type { VideoFile, Tag, Collection, AppSettings, SortField, SortDir } from '@/types'
+import type {
+  VideoFile, Tag, Collection, AppSettings, SortField, SortDir,
+  MageArchitecture, MageConfig, MageEntity, MageGeneration,
+} from '@/types'
 
 interface PlayerState {
   currentVideo: VideoFile | null
@@ -61,7 +64,34 @@ interface DataState {
   videoCollections: Record<string, string[]>
 }
 
-interface AppStore extends PlayerState, UIState, DataState {
+/** The Studio form, kept in the store so the gallery (Remix, Use as input)
+    and the entity panel (insert @handle) can fill it. */
+export interface MageDraft {
+  mediaType: 'image' | 'video'
+  architecture: string | null
+  prompt: string
+  /** Option fields (model_id, aspect_ratio, resolution, duration…), plus seed/negative_prompt */
+  config: Record<string, unknown>
+  /** Local image paths by role; mapped to the model's fields on submit */
+  references: string[]
+  firstFrame: string | null
+  lastFrame: string | null
+}
+
+interface MageState {
+  /** Top-level section: the video library or the Mage Create studio */
+  mode: 'library' | 'create'
+  mageConfig: MageConfig | null
+  mageBalance: number | null
+  mageArchitectures: MageArchitecture[]
+  mageGenerations: MageGeneration[]
+  mageEntities: MageEntity[]
+  mageDraft: MageDraft
+  /** Create-character/reference dialog, optionally prefilled with an image */
+  mageEntityModal: { type: 'character' | 'reference'; filePath?: string } | null
+}
+
+interface AppStore extends PlayerState, UIState, DataState, MageState {
   settings: AppSettings
 
   // Player actions
@@ -123,6 +153,30 @@ interface AppStore extends PlayerState, UIState, DataState {
   setWatchedFolders: (folders: string[]) => void
   setStats: (stats: DataState['stats']) => void
   updateSettings: (updates: Partial<AppSettings>) => void
+
+  // Mage actions
+  setMode: (mode: 'library' | 'create') => void
+  setMageConfig: (config: MageConfig | null) => void
+  setMageBalance: (balance: number | null) => void
+  setMageArchitectures: (archs: MageArchitecture[]) => void
+  setMageGenerations: (gens: MageGeneration[]) => void
+  upsertMageGeneration: (gen: MageGeneration) => void
+  removeMageGeneration: (id: string) => void
+  setMageEntities: (entities: MageEntity[]) => void
+  addMageEntity: (entity: MageEntity) => void
+  removeMageEntity: (id: string) => void
+  updateMageDraft: (updates: Partial<MageDraft>) => void
+  setMageEntityModal: (v: MageState['mageEntityModal']) => void
+}
+
+const defaultMageDraft: MageDraft = {
+  mediaType: 'image',
+  architecture: null,
+  prompt: '',
+  config: {},
+  references: [],
+  firstFrame: null,
+  lastFrame: null,
 }
 
 const defaultSettings: AppSettings = {
@@ -186,6 +240,16 @@ export const useStore = create<AppStore>()(
       videoCollections: {},
 
       settings: defaultSettings,
+
+      // Mage state
+      mode: 'library',
+      mageConfig: null,
+      mageBalance: null,
+      mageArchitectures: [],
+      mageGenerations: [],
+      mageEntities: [],
+      mageDraft: defaultMageDraft,
+      mageEntityModal: null,
 
       // Player actions
       playVideo: (video, queue) =>
@@ -345,6 +409,32 @@ export const useStore = create<AppStore>()(
       setStats: (stats) => set({ stats }),
       updateSettings: (updates) =>
         set((state) => ({ settings: { ...state.settings, ...updates } })),
+
+      // Mage actions
+      setMode: (mode) => set({ mode }),
+      setMageConfig: (config) => set({ mageConfig: config }),
+      setMageBalance: (balance) => set({ mageBalance: balance }),
+      setMageArchitectures: (archs) => set({ mageArchitectures: archs }),
+      setMageGenerations: (gens) => set({ mageGenerations: gens }),
+      upsertMageGeneration: (gen) =>
+        set((state) => {
+          const exists = state.mageGenerations.some((g) => g.id === gen.id)
+          return {
+            mageGenerations: exists
+              ? state.mageGenerations.map((g) => (g.id === gen.id ? gen : g))
+              : [gen, ...state.mageGenerations],
+          }
+        }),
+      removeMageGeneration: (id) =>
+        set((state) => ({ mageGenerations: state.mageGenerations.filter((g) => g.id !== id) })),
+      setMageEntities: (entities) => set({ mageEntities: entities }),
+      addMageEntity: (entity) =>
+        set((state) => ({ mageEntities: [entity, ...state.mageEntities.filter((e) => e.id !== entity.id)] })),
+      removeMageEntity: (id) =>
+        set((state) => ({ mageEntities: state.mageEntities.filter((e) => e.id !== id) })),
+      updateMageDraft: (updates) =>
+        set((state) => ({ mageDraft: { ...state.mageDraft, ...updates } })),
+      setMageEntityModal: (v) => set({ mageEntityModal: v }),
     }),
     {
       name: 'videovault-store',
@@ -357,7 +447,14 @@ export const useStore = create<AppStore>()(
         volume: state.volume,
         watchedFolders: state.watchedFolders,
         tagFilterMode: state.tagFilterMode,
+        mode: state.mode,
+        mageDraft: state.mageDraft,
       }),
+      // Fill draft fields added after the draft was persisted
+      merge: (persisted, current) => {
+        const p = (persisted ?? {}) as Partial<AppStore>
+        return { ...current, ...p, mageDraft: { ...current.mageDraft, ...p.mageDraft } }
+      },
     }
   )
 )

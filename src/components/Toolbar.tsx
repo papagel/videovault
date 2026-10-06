@@ -4,7 +4,7 @@ import { useShallow } from 'zustand/react/shallow'
 import {
   Grid3X3, List, FolderPlus, Merge,
   Scissors, Tag, Trash2, SortAsc, SortDesc, ChevronDown,
-  PanelLeftClose, PanelLeft,
+  PanelLeftClose, PanelLeft, Library, Sparkles, Gem,
 } from 'lucide-react'
 import { useStore } from '@/store'
 import { cn } from '@/lib/utils'
@@ -20,8 +20,12 @@ export function Toolbar() {
     setShowRenameModal,
     setWatchedFolders, setScanning,
     triggerDelete,
+    mode, setMode, mageBalance,
   } = useStore(
     useShallow((s) => ({
+      mode: s.mode,
+      setMode: s.setMode,
+      mageBalance: s.mageBalance,
       view: s.view,
       gridSize: s.gridSize,
       sidebarOpen: s.sidebarOpen,
@@ -70,8 +74,48 @@ export function Toolbar() {
     { field: 'play_count', label: 'Plays' },
   ]
 
+  const modeSwitch = (
+    <div className="flex items-center bg-[#16161f] border border-[#2a2a3a] rounded-lg p-0.5">
+      {([
+        { m: 'library', label: 'Library', icon: <Library size={13} /> },
+        { m: 'create', label: 'Create', icon: <Sparkles size={13} /> },
+      ] as const).map(({ m, label, icon }) => (
+        <button
+          key={m}
+          onClick={() => setMode(m)}
+          className={cn(
+            'flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium transition-all',
+            mode === m ? 'bg-[#2a2a3a] text-white' : 'text-[#55556a] hover:text-[#8888aa]'
+          )}
+        >
+          {icon}
+          {label}
+        </button>
+      ))}
+    </div>
+  )
+
+  if (mode === 'create') {
+    return (
+      <div className="flex-shrink-0 flex items-center gap-2 px-4 h-12 border-b border-[#2a2a3a] bg-[#0d0d14]">
+        {modeSwitch}
+        <div className="flex-1" />
+        {mageBalance != null && (
+          <span className="flex items-center gap-1.5 text-xs text-[#8888aa] bg-[#16161f] border border-[#2a2a3a] rounded-lg px-2.5 py-1.5 tabular-nums" title="Mage Gems balance">
+            <Gem size={12} className="text-[#6366f1]" />
+            {Math.floor(mageBalance).toLocaleString()}
+          </span>
+        )}
+      </div>
+    )
+  }
+
   return (
     <div className="flex-shrink-0 flex items-center gap-2 px-4 h-12 border-b border-[#2a2a3a] bg-[#0d0d14]">
+      {modeSwitch}
+
+      <div className="w-px h-5 bg-[#2a2a3a] mx-1" />
+
       {/* Sidebar toggle */}
       <button
         onClick={toggleSidebar}

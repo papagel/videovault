@@ -235,7 +235,7 @@ pub async fn scan_folder(
     Ok(results)
 }
 
-fn get_video_by_id_internal(db: &DbState, id: &str) -> Result<VideoFile> {
+pub(crate) fn get_video_by_id_internal(db: &DbState, id: &str) -> Result<VideoFile> {
     let conn = db.0.lock().map_err(|_| anyhow::anyhow!("lock error"))?;
 
     let video = conn.query_row(
@@ -292,7 +292,7 @@ fn get_tags_for_video(conn: &Connection, video_id: &str) -> Result<Vec<Tag>> {
 /// Probe and index a single video file into the DB.
 /// Returns `None` if the file is already indexed or an error occurs.
 /// Must be called inside `tokio::task::block_in_place` from an async context.
-fn index_single_video(db: &DbState, path: &str, thumb_dir: &str) -> Option<VideoFile> {
+pub(crate) fn index_single_video(db: &DbState, path: &str, thumb_dir: &str) -> Option<VideoFile> {
     // Check if already indexed (brief lock). A soft-deleted row for the same
     // path is resurrected instead of inserting (path is UNIQUE, so INSERT OR
     // IGNORE would silently no-op and we'd emit a phantom entry).
