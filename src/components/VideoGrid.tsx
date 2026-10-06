@@ -4,6 +4,7 @@ import { X } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '@/store'
 import { VideoCard } from './VideoCard'
+import { hasTags, inFolders, sortVideos } from '@/lib/library'
 import { VideoListRow } from './VideoListRow'
 import type { VideoFile } from '@/types'
 
@@ -127,9 +128,7 @@ export function VideoGrid() {
     }
 
     if (activeFolders.length > 0) {
-      source = source.filter((v) =>
-        activeFolders.some((f) => v.folder === f || v.folder.startsWith(f + '/'))
-      )
+      source = source.filter((v) => inFolders(v, activeFolders))
     }
 
     if (letterFilter) {
@@ -137,11 +136,7 @@ export function VideoGrid() {
     }
 
     if (activeTags.length > 0) {
-      source = source.filter((v) =>
-        tagFilterMode === 'or'
-          ? activeTags.some((tagName) => v.tags.some((t) => t.name === tagName))
-          : activeTags.every((tagName) => v.tags.some((t) => t.name === tagName))
-      )
+      source = source.filter((v) => hasTags(v, activeTags, tagFilterMode))
     }
 
     if (searchQuery) {
@@ -153,27 +148,7 @@ export function VideoGrid() {
     // drag-and-drop reordering is meaningful and indices map 1:1 to positions.
     if (activeCollection) return [...source]
 
-    return [...source].sort((a, b) => {
-      let cmp = 0
-      switch (sortField) {
-        case 'filename':
-          cmp = a.filename.localeCompare(b.filename)
-          break
-        case 'duration_secs':
-          cmp = a.duration_secs - b.duration_secs
-          break
-        case 'size_bytes':
-          cmp = a.size_bytes - b.size_bytes
-          break
-        case 'modified_at':
-          cmp = (a.modified_at ?? '').localeCompare(b.modified_at ?? '')
-          break
-        case 'play_count':
-          cmp = a.play_count - b.play_count
-          break
-      }
-      return sortDir === 'asc' ? cmp : -cmp
-    })
+    return sortVideos(source, sortField, sortDir)
   }, [videos, collectionVideos, activeFolders, letterFilter, activeTags, tagFilterMode, searchQuery, sortField, sortDir, activeCollection, pendingDeleteIds])
 
   // Filter changes commit instantly (sidebar highlight); the card window

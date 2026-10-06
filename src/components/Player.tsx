@@ -7,6 +7,7 @@ import {
 import { useStore } from '@/store'
 import { cn, formatDuration, getThumbnailSrc } from '@/lib/utils'
 import { convertFileSrc } from '@tauri-apps/api/core'
+import { PlayerContext } from './PlayerContext'
 
 export function Player() {
   const {
@@ -18,6 +19,7 @@ export function Player() {
     duration,
     queue,
     queueIndex,
+    queueLabel,
     shuffleEnabled,
     playbackKey,
     settings,
@@ -318,6 +320,9 @@ export function Player() {
             'absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent pt-16 pb-4 px-6 transition-opacity duration-300',
             isFullscreen && !controlsVisible ? 'opacity-0 pointer-events-none' : 'opacity-100'
           )}>
+            {/* References and tags (left), folder (right) */}
+            <PlayerContext video={currentVideo} onClose={closePlayer} />
+
             {/* Seek bar */}
             <div className="relative h-1 mb-4 cursor-pointer">
               <div className="absolute inset-0 bg-white/20 rounded-full" />
@@ -364,8 +369,9 @@ export function Player() {
               <p className="text-sm text-white/70 truncate max-w-xs">
                 {currentVideo.filename.replace(/\.[^/.]+$/, '')}
               </p>
-              <span className="text-xs text-white/40 flex-shrink-0">
+              <span className="text-xs text-white/40 flex-shrink-0" title={queueLabel ? `Playing through: ${queueLabel}` : undefined}>
                 {queueIndex + 1}/{queue.length}
+                {queueLabel && <span className="ml-1 text-white/60">· {queueLabel}</span>}
                 {shuffleEnabled && <span className="ml-1 text-[#6366f1]">✦</span>}
               </span>
 

@@ -8,6 +8,8 @@ interface PlayerState {
   currentVideo: VideoFile | null
   queue: VideoFile[]
   queueIndex: number
+  /** What the queue is (e.g. "@ana", a folder name) when picked in the player */
+  queueLabel: string | null
   isPlaying: boolean
   volume: number
   isMuted: boolean
@@ -111,6 +113,8 @@ interface AppStore extends PlayerState, UIState, DataState, MageState {
   /** `selectOnClose: false` leaves the selection empty when the player closes */
   playVideo: (video: VideoFile, queue?: VideoFile[], opts?: { selectOnClose?: boolean }) => void
   playNext: () => void
+  /** Keep playing the current video, then continue through `queue` */
+  setQueue: (queue: VideoFile[], label: string | null) => void
   playPrev: () => void
   setPlaying: (v: boolean) => void
   setVolume: (v: number) => void
@@ -226,6 +230,7 @@ export const useStore = create<AppStore>()(
       currentVideo: null,
       queue: [],
       queueIndex: 0,
+      queueLabel: null,
       isPlaying: false,
       volume: 0.8,
       isMuted: false,
@@ -300,10 +305,20 @@ export const useStore = create<AppStore>()(
             selectPlayedOnClose: opts?.selectOnClose ?? true,
             currentVideo: video,
             queue: q,
+            queueLabel: null,
             queueIndex: idx >= 0 ? idx : 0,
             isPlaying: true,
             playbackKey: state.playbackKey + 1,
           }
+        }),
+
+      setQueue: (queue, label) =>
+        set((state) => {
+          const idx = state.currentVideo ? queue.findIndex((v) => v.id === state.currentVideo!.id) : -1
+          // If the current video isn't in it, it plays on and "next" starts the list
+          return idx >= 0
+            ? { queue, queueIndex: idx, queueLabel: label }
+            : { queue: state.currentVideo ? [state.currentVideo, ...queue] : queue, queueIndex: 0, queueLabel: label }
         }),
 
       playNext: () =>

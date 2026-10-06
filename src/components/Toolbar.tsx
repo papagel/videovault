@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from 'react'
 import { useShallow } from 'zustand/react/shallow'
 import {
   Grid3X3, List, Merge,
@@ -12,10 +13,9 @@ import type { SortField } from '@/types'
 
 export function Toolbar() {
   const {
-    view, gridSize, sidebarOpen, sortField, sortDir,
+    view, gridSize, sidebarOpen,
     selectedVideoIds,
     setView, setGridSize, toggleSidebar,
-    setSortField, setSortDir,
     setShowMergeModal, setShowTrimModal, setShowTagModal,
     setShowRenameModal,
     triggerDelete,
@@ -28,14 +28,10 @@ export function Toolbar() {
       view: s.view,
       gridSize: s.gridSize,
       sidebarOpen: s.sidebarOpen,
-      sortField: s.sortField,
-      sortDir: s.sortDir,
       selectedVideoIds: s.selectedVideoIds,
       setView: s.setView,
       setGridSize: s.setGridSize,
       toggleSidebar: s.toggleSidebar,
-      setSortField: s.setSortField,
-      setSortDir: s.setSortDir,
       setShowMergeModal: s.setShowMergeModal,
       setShowTrimModal: s.setShowTrimModal,
       setShowTagModal: s.setShowTagModal,
@@ -119,39 +115,7 @@ export function Toolbar() {
       <div className="w-px h-5 bg-[#2a2a3a] mx-1" />
 
       {/* Sort */}
-      <div className="relative group">
-        <button className="flex items-center gap-1.5 text-xs text-[#8888aa] hover:text-white bg-[#16161f] border border-[#2a2a3a] rounded-lg px-2.5 py-1.5 transition-all">
-          {sortDir === 'asc' ? <SortAsc size={13} /> : <SortDesc size={13} />}
-          <span>{sortOptions.find((o) => o.field === sortField)?.label}</span>
-          <ChevronDown size={11} />
-        </button>
-        <div className="absolute top-full left-0 mt-1 bg-[#16161f] border border-[#2a2a3a] rounded-lg shadow-xl py-1 z-50 min-w-32 hidden group-hover:block">
-          {sortOptions.map((opt) => (
-            <button
-              key={opt.field}
-              onClick={() => {
-                if (sortField === opt.field) setSortDir(sortDir === 'asc' ? 'desc' : 'asc')
-                else { setSortField(opt.field); setSortDir('asc') }
-              }}
-              className={cn(
-                'w-full text-left px-3 py-1.5 text-xs hover:bg-[#1e1e2a] transition-all',
-                sortField === opt.field ? 'text-[#6366f1]' : 'text-[#8888aa]'
-              )}
-            >
-              {opt.label}
-            </button>
-          ))}
-          <div className="border-t border-[#2a2a3a] mt-1 pt-1">
-            <button
-              onClick={() => setSortDir(sortDir === 'asc' ? 'desc' : 'asc')}
-              className="w-full text-left px-3 py-1.5 text-xs text-[#8888aa] hover:bg-[#1e1e2a] flex items-center gap-2"
-            >
-              {sortDir === 'asc' ? <SortAsc size={11} /> : <SortDesc size={11} />}
-              {sortDir === 'asc' ? 'Ascending' : 'Descending'}
-            </button>
-          </div>
-        </div>
-      </div>
+      <SortMenu options={sortOptions} />
 
       <div className="flex-1" />
 
@@ -318,5 +282,102 @@ function QuickMixStatus() {
     <span className="flex items-center gap-1.5 text-[11px] text-[#8888aa] tabular-nums">
       <Loader2 size={12} className="animate-spin text-[#6366f1]" /> 8s mix {Math.round((status.progress ?? 0) * 100)}%
     </span>
+  )
+}
+
+/**
+ * Sort order menu. Opens on click (stays open until an option is picked,
+ * a click elsewhere or Esc) or on hover, which waits before closing so the
+ * pointer can travel to the list.
+ */
+function SortMenu({ options }: { options: { field: SortField; label: string }[] }) {
+  const { sortField, sortDir, setSortField, setSortDir } = useStore(
+    useShallow((s) => ({ sortField: s.sortField, sortDir: s.sortDir, setSortField: s.setSortField, setSortDir: s.setSortDir }))
+  )
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const closeTimer = useRef<number | null>(null)
+
+  const cancelClose = () => {
+    if (closeTimer.current) window.clearTimeout(closeTimer.current)
+    closeTimer.current = null
+  }
+  const closeSoon = () => {
+    cancelClose()
+    closeTimer.current = window.setTimeout(() => setOpen(false), 450)
+  }
+
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { e.stopPropagation(); setOpen(false) }
+    }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey, { capture: true })
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey, { capture: true })
+    }
+  }, [open])
+
+  useEffect(() => cancelClose, [])
+
+  const pick = (field: SortField) => {
+    if (sortField === field) setSortDir(sortDir === 'asc' ? 'desc' : 'asc')
+    else { setSortField(field); setSortDir('asc') }
+    cancelClose()
+    setOpen(false)
+  }
+
+  return (
+    <div
+      ref={rootRef}
+      className="relative"
+      onMouseEnter={() => { cancelClose(); setOpen(true) }}
+      onMouseLeave={closeSoon}
+    >
+      <button
+        onClick={() => { cancelClose(); setOpen((o) => !o) }}
+        className={cn(
+          'flex items-center gap-1.5 text-xs bg-[#16161f] border rounded-lg px-2.5 py-1.5 transition-all',
+          open ? 'text-white border-[#3a3a5a]' : 'text-[#8888aa] hover:text-white border-[#2a2a3a]'
+        )}
+      >
+        {sortDir === 'asc' ? <SortAsc size={13} /> : <SortDesc size={13} />}
+        <span>{options.find((o) => o.field === sortField)?.label}</span>
+        <ChevronDown size={11} className={cn('transition-transform', open && 'rotate-180')} />
+      </button>
+      {open && (
+        // pt-1 instead of a margin: the gap above the list still counts as "inside"
+        <div className="absolute top-full left-0 pt-1 z-50 min-w-32">
+          <div className="bg-[#16161f] border border-[#2a2a3a] rounded-lg shadow-xl py-1">
+            {options.map((opt) => (
+              <button
+                key={opt.field}
+                onClick={() => pick(opt.field)}
+                className={cn(
+                  'w-full text-left px-3 py-1.5 text-xs hover:bg-[#1e1e2a] transition-all',
+                  sortField === opt.field ? 'text-[#6366f1]' : 'text-[#8888aa]'
+                )}
+              >
+                {opt.label}
+              </button>
+            ))}
+            <div className="border-t border-[#2a2a3a] mt-1 pt-1">
+              <button
+                onClick={() => setSortDir(sortDir === 'asc' ? 'desc' : 'asc')}
+                className="w-full text-left px-3 py-1.5 text-xs text-[#8888aa] hover:bg-[#1e1e2a] flex items-center gap-2"
+              >
+                {sortDir === 'asc' ? <SortAsc size={11} /> : <SortDesc size={11} />}
+                {sortDir === 'asc' ? 'Ascending' : 'Descending'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
