@@ -70,14 +70,224 @@ fn adds_to_library(conn: &Connection) -> bool {
     db::get_setting(conn, ADD_TO_LIBRARY_KEY).as_deref() != Some("0")
 }
 
-/// The Mage folder as a path prefix, when its videos are kept out of the
-/// library. Library scans and the folder watcher skip paths under it.
+/// The Mage folder's Videos section as a path prefix, when generated videos
+/// are kept out of the library. Library scans and the folder watcher skip
+/// paths under it (merges in Mage/Merged still show).
 pub fn library_exclusion(app: &AppHandle) -> Option<String> {
     with_conn(app, |conn| {
-        Ok((!adds_to_library(conn)).then(|| format!("{}/", output_dir(app, conn).trim_end_matches('/'))))
+        Ok((!adds_to_library(conn))
+            .then(|| format!("{}/{}/", output_dir(app, conn).trim_end_matches('/'), SECTION_VIDEOS)))
     })
     .ok()
     .flatten()
+}
+
+// ── Mage folder sections ────────────────────────────────────────────────────
+//
+//   Mage/Images/2026-10/…      generated and imported images
+//   Mage/Videos/2026-10/…      generated and imported videos (in the library)
+//   Mage/Audio/2026-10/…       generated audio
+//   Mage/Merged/…              merges of Mage videos (video_merge_NN.mp4)
+//   Mage/References/<result>/  copies of a generation's input images
+
+const SECTION_IMAGES: &str = "Images";
+const SECTION_VIDEOS: &str = "Videos";
+const SECTION_AUDIO: &str = "Audio";
+const SECTION_REFERENCES: &str = "References";
+const SECTION_MERGED: &str = "Merged";
+/// app_settings key: the folder has been sorted into sections
+const LAYOUT_KEY: &str = "mage_folder_layout";
+
+fn result_section(media_type: &str) -> &'static str {
+    match media_type {
+        "video" => SECTION_VIDEOS,
+        "audio" => SECTION_AUDIO,
+        _ => SECTION_IMAGES,
+    }
+}
+
+/// Local year-month of a timestamp, for the monthly subfolders.
+fn month_of(created_at: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(created_at)
+        .map(|t| t.with_timezone(&chrono::Local))
+        .unwrap_or_else(|_| chrono::Local::now().into())
+        .format("%Y-%m")
+        .to_string()
+}
+
+/// `<Mage folder>/<section>[/<month>]`, created if needed.
+fn section_dir(app: &AppHandle, section: &str, month: Option<&str>) -> Result<PathBuf, String> {
+    let mut dir = ensure_output_dir(app)?.join(section);
+    if let Some(m) = month {
+        dir = dir.join(m);
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create {}: {}", dir.display(), e))?;
+    Ok(dir)
+}
+
+/// Where a merge goes when any of its clips comes from the Mage folder:
+/// Mage/Merged. None for merges of other videos.
+pub fn merged_dir_for(app: &AppHandle, clip_paths: &[String]) -> Option<String> {
+    let root = with_conn(app, |conn| Ok(output_dir(app, conn))).ok()?;
+    let prefix = format!("{}/", root.trim_end_matches('/'));
+    if !clip_paths.iter().any(|p| p.starts_with(&prefix)) {
+        return None;
+    }
+    section_dir(app, SECTION_MERGED, None).ok().map(|d| d.to_string_lossy().to_string())
+}
+
+/// `path`, or `name (2).ext`, `name (3).ext`… if it's taken.
+fn free_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    (2..)
+        .map(|n| dir.join(format!("{} ({}){}", stem, n, ext)))
+        .find(|p| !p.exists())
+        .unwrap()
+}
+
+/// One-time move of an older, flat Mage folder into the sections: results
+/// into Images/Videos by month, `<result>_inputs` folders into References,
+/// video_merge files into Merged. Database rows are updated before each move,
+/// so the folder watcher never sees a library video "disappear" (tags,
+/// collections and play counts stay), and Remix keeps finding its inputs.
+pub fn reorganize_mage_folder(app: &AppHandle) {
+    let (root, done) = match with_conn(app, |conn| {
+        Ok((output_dir(app, conn), db::get_setting(conn, LAYOUT_KEY).as_deref() == Some("sections")))
+    }) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let mark_done = || {
+        let _ = with_conn(app, |conn| {
+            db::set_setting(conn, LAYOUT_KEY, "sections").map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))
+        });
+    };
+    let root = PathBuf::from(root);
+    if done || !root.is_dir() {
+        mark_done();
+        return;
+    }
+    let in_root = |p: &Path| p.parent() == Some(root.as_path());
+    let mut moved = 0;
+
+    // Move a library-visible file: rows first, then the file (rows back on failure)
+    let move_file = |old: &Path, new_dir: &Path, update_rows: &dyn Fn(&Connection, &str, &str) -> rusqlite::Result<()>| -> bool {
+        if std::fs::create_dir_all(new_dir).is_err() {
+            return false;
+        }
+        let Some(name) = old.file_name() else { return false };
+        let new = free_path(new_dir.join(name));
+        let (o, n) = (old.to_string_lossy().to_string(), new.to_string_lossy().to_string());
+        if with_conn(app, |conn| update_rows(conn, &o, &n)).is_err() {
+            return false;
+        }
+        if std::fs::rename(old, &new).is_err() {
+            let _ = with_conn(app, |conn| update_rows(conn, &n, &o));
+            return false;
+        }
+        true
+    };
+    let update_video_row = |conn: &Connection, from: &str, to: &str| -> rusqlite::Result<()> {
+        let folder = Path::new(to).parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+        conn.execute("UPDATE videos SET path = ?1, folder = ?2 WHERE path = ?3", params![to, folder, from])?;
+        Ok(())
+    };
+
+    // 1. Results of generations and imports
+    let rows: Vec<(String, String, String, String)> = with_conn(app, |conn| {
+        conn.prepare("SELECT id, media_type, created_at, local_path FROM mage_generations WHERE local_path IS NOT NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect()
+    })
+    .unwrap_or_default();
+    for (id, media_type, created_at, local) in rows {
+        let old = PathBuf::from(&local);
+        if !in_root(&old) || !old.is_file() {
+            continue;
+        }
+        let new_dir = root.join(result_section(&media_type)).join(month_of(&created_at));
+        let ok = move_file(&old, &new_dir, &|conn, from, to| {
+            conn.execute(
+                "UPDATE mage_generations SET local_path = ?1 WHERE id = ?2 AND local_path = ?3",
+                params![to, id, from],
+            )?;
+            update_video_row(conn, from, to)
+        });
+        if ok {
+            moved += 1;
+        }
+    }
+
+    // 2. `<result>_inputs` folders → References/<result>
+    let refs_root = root.join(SECTION_REFERENCES);
+    let inputs: Vec<(String, String)> = with_conn(app, |conn| {
+        conn.prepare("SELECT id, inputs_json FROM mage_generations WHERE inputs_json LIKE '%_inputs/%'")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
+    })
+    .unwrap_or_default();
+    for (id, json_text) in inputs {
+        let mut text = json_text.clone();
+        let paths: Vec<String> = serde_json::from_str::<Value>(&json_text)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .map(|o| {
+                o.values()
+                    .flat_map(|v| match v {
+                        Value::String(s) => vec![s.clone()],
+                        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+                        _ => vec![],
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for p in paths {
+            let Some(dir) = Path::new(&p).parent() else { continue };
+            let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let Some(base) = name.strip_suffix("_inputs") else { continue };
+            if !in_root(dir) {
+                continue;
+            }
+            let new_dir = refs_root.join(base);
+            if dir.is_dir() && !new_dir.exists() {
+                let _ = std::fs::create_dir_all(&refs_root);
+                if std::fs::rename(dir, &new_dir).is_err() {
+                    continue;
+                }
+                moved += 1;
+            }
+            if new_dir.is_dir() {
+                text = text.replace(&dir.to_string_lossy().to_string(), &new_dir.to_string_lossy().to_string());
+            }
+        }
+        if text != json_text {
+            let _ = with_conn(app, |conn| {
+                conn.execute("UPDATE mage_generations SET inputs_json = ?1 WHERE id = ?2", params![text, id])
+            });
+        }
+    }
+
+    // 3. video_merge_NN files → Merged
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let is_merge = p.is_file()
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_lowercase().starts_with("video_merge_"));
+            if is_merge && move_file(&p, &root.join(SECTION_MERGED), &update_video_row) {
+                moved += 1;
+            }
+        }
+    }
+
+    mark_done();
+    if moved > 0 {
+        log::info!("Sorted {} item(s) of the Mage folder into sections", moved);
+    }
 }
 
 /// Create the Mage folder and, when generated videos go to the library,
@@ -214,6 +424,10 @@ pub struct Generation {
     pub video_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Mage's id, for generations imported from Mage
+    pub remote_id: Option<String>,
+    /// Where an imported generation was made: app, api, mcp…
+    pub origin: Option<String>,
     #[serde(skip)]
     idempotency_key: String,
     #[serde(skip)]
@@ -225,7 +439,7 @@ pub struct Generation {
 const GEN_COLUMNS: &str = "id, request_id, architecture, model_id, media_type, prompt,
     config_json, inputs_json, status, error, gems_charged, gems_refunded, seed, result_url,
     result_expires_at, local_path, width, height, video_id, created_at, updated_at,
-    idempotency_key, status_url, cancel_url";
+    idempotency_key, status_url, cancel_url, remote_id, origin";
 
 fn row_to_generation(row: &rusqlite::Row) -> rusqlite::Result<Generation> {
     let parse = |s: String| serde_json::from_str(&s).unwrap_or(Value::Null);
@@ -254,6 +468,8 @@ fn row_to_generation(row: &rusqlite::Row) -> rusqlite::Result<Generation> {
         idempotency_key: row.get(21)?,
         status_url: row.get(22)?,
         cancel_url: row.get(23)?,
+        remote_id: row.get(24)?,
+        origin: row.get(25)?,
     })
 }
 
@@ -356,6 +572,9 @@ pub async fn mage_generate(args: GenerateArgs, app: AppHandle) -> Result<Generat
     let prompt = args.config.get("prompt").and_then(Value::as_str).unwrap_or("").to_string();
     let model_id = args.config.get("model_id").and_then(Value::as_str).map(str::to_string);
     let ts = now();
+    // Keep copies of the input images next to the result, so Remix still
+    // finds them after the originals move (Mage's own copies expire)
+    let inputs = keep_input_copies(&app, &file_base(&ts, &args.architecture, &id), &Value::Object(args.inputs));
     with_conn(&app, |conn| {
         conn.execute(
             "INSERT INTO mage_generations
@@ -370,7 +589,7 @@ pub async fn mage_generate(args: GenerateArgs, app: AppHandle) -> Result<Generat
                 args.media_type,
                 prompt,
                 Value::Object(args.config).to_string(),
-                Value::Object(args.inputs).to_string(),
+                inputs.to_string(),
                 ts
             ],
         )
@@ -481,6 +700,17 @@ pub async fn mage_remove_generation(id: String, trash_file: Option<bool>, app: A
     if let (Some(path), true) = (local, trash_file.unwrap_or(false)) {
         if Path::new(&path).exists() {
             commands::move_to_trash(&path)?;
+        }
+        // Its input copies go too (References/<result>, or beside it in older layouts)
+        let stem = Path::new(&path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let root = with_conn(&app, |conn| Ok(output_dir(&app, conn)))?;
+        for dir in [
+            PathBuf::from(&root).join(SECTION_REFERENCES).join(&stem),
+            PathBuf::from(Path::new(&path).with_extension("").to_string_lossy().to_string() + "_inputs"),
+        ] {
+            if !stem.is_empty() && dir.is_dir() {
+                let _ = commands::move_to_trash(&dir.to_string_lossy());
+            }
         }
         with_conn(&app, |conn| {
             conn.execute("UPDATE videos SET is_deleted = 1 WHERE path = ?1", params![path])
@@ -615,15 +845,85 @@ async fn poll(
     }
 }
 
+/// A generation's file name in the Mage folder, without extension: when it
+/// was made (an import keeps its original date), the model and a short id.
+/// Its input copies sit beside it in `<base>_inputs/`.
+fn file_base(created_at: &str, architecture: &str, id: &str) -> String {
+    let made = chrono::DateTime::parse_from_rfc3339(created_at)
+        .map(|t| t.with_timezone(&chrono::Local))
+        .unwrap_or_else(|_| chrono::Local::now());
+    format!("{}_{}_{}", made.format("%Y%m%d-%H%M%S"), architecture, &id[..8.min(id.len())])
+}
+
+/// Copy a generation's input images into `<Mage folder>/<base>_inputs/`,
+/// named by their field (`first_image.png`, `additional_images-2.jpg`…), and
+/// return the inputs pointing at the copies. Videos and links stay as they
+/// are (a copied video would also land in the library). On any failure the
+/// original paths are kept.
+fn keep_input_copies(app: &AppHandle, base: &str, inputs: &Value) -> Value {
+    let Some(fields) = inputs.as_object().filter(|f| !f.is_empty()) else {
+        return inputs.clone();
+    };
+    let is_image = |p: &str| {
+        let ext = Path::new(p).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp") && Path::new(p).is_file()
+    };
+    if !fields.values().any(|v| match v {
+        Value::String(p) => is_image(p),
+        Value::Array(list) => list.iter().filter_map(Value::as_str).any(is_image),
+        _ => false,
+    }) {
+        return inputs.clone();
+    }
+    let Ok(dir) = section_dir(app, SECTION_REFERENCES, None).map(|d| d.join(base)) else {
+        return inputs.clone();
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return inputs.clone();
+    }
+    let copy = |path: &str, name: String| -> String {
+        // Not an image, or already one of this generation's copies
+        if !is_image(path) || Path::new(path).starts_with(&dir) {
+            return path.to_string();
+        }
+        let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("png").to_lowercase();
+        let dest = dir.join(format!("{}.{}", name, ext));
+        match std::fs::copy(path, &dest) {
+            Ok(_) => dest.to_string_lossy().to_string(),
+            Err(_) => path.to_string(),
+        }
+    };
+    let mut out = Map::new();
+    for (field, value) in fields {
+        let kept = match value {
+            Value::String(p) => Value::String(copy(p, field.clone())),
+            Value::Array(list) => Value::Array(
+                list.iter()
+                    .enumerate()
+                    .map(|(i, v)| match v.as_str() {
+                        Some(p) => Value::String(copy(p, format!("{}-{}", field, i + 1))),
+                        None => v.clone(),
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        };
+        out.insert(field.clone(), kept);
+    }
+    Value::Object(out)
+}
+
+/// At most this many result downloads at once (imports can queue many)
+fn download_slots() -> &'static tokio::sync::Semaphore {
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(3))
+}
+
 async fn finish_download(app: &AppHandle, g: &Generation) -> Result<(), String> {
     let url = g.result_url.clone().ok_or("Mage returned no result")?;
-    let dir = ensure_output_dir(app)?;
-    let base = format!(
-        "{}_{}_{}",
-        chrono::Local::now().format("%Y%m%d-%H%M%S"),
-        g.architecture,
-        &g.id[..8]
-    );
+    let _slot = download_slots().acquire().await.map_err(|e| e.to_string())?;
+    let dir = section_dir(app, result_section(&g.media_type), Some(&month_of(&g.created_at)))?;
+    let base = file_base(&g.created_at, &g.architecture, &g.id);
     // Hidden temp name: the folder watcher ignores dotfiles mid-write.
     let tmp = dir.join(format!(".{}.part", base));
     let content_type = match mage::download(&url, &tmp).await {
@@ -967,6 +1267,12 @@ pub async fn mage_sync_entities(app: AppHandle) -> Result<Vec<MageEntity>, Strin
             .iter()
             .map(|v| entity_from_json(v, "reference")),
     );
+
+    // Temporary references for website runs stay out of the list
+    let temp: std::collections::HashSet<String> = with_conn(&app, |conn| {
+        conn.prepare("SELECT id FROM mage_temp_refs")?.query_map([], |r| r.get(0))?.collect()
+    })?;
+    remote.retain(|e| !temp.contains(&e.id));
 
     let cached: std::collections::HashMap<String, String> = with_conn(&app, |conn| {
         conn.prepare("SELECT id, local_image_path FROM mage_entities WHERE local_image_path IS NOT NULL")?
@@ -1335,7 +1641,45 @@ pub async fn mage_update_entity(args: UpdateEntityArgs, app: AppHandle) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::mentioned_handles;
+    use super::{mentioned_handles, normalize_time, remote_from_creation, remote_from_history, tool_json};
+    use serde_json::json;
+
+    #[test]
+    fn reads_mage_history_and_creations() {
+        let answer = json!({
+            "content": [{ "type": "text", "text": "2 items" }],
+            "structuredContent": { "history": [
+                { "history_id": "h1", "architecture": "lemon", "model_id": "lemon", "prompt": "a walk @ana",
+                  "created_at": "2026-10-06T16:17:02.354Z", "source": "app", "status": "completed",
+                  "request_id": null, "billing": { "mode": "unlimited" },
+                  "result": { "type": "video", "url": "https://cdn/x.mp4", "width": 720, "height": 1280,
+                              "seed": 7, "expires_at": "2026-11-05T16:17:02Z", "moderation": { "nsfw": false } } },
+                { "history_id": "h2", "architecture": "lemon", "status": "in_progress", "result": null,
+                  "created_at": "2026-10-06T16:30:53.085Z", "source": "app", "prompt": "" }
+            ], "next_cursor": "c2" }
+        });
+        let body = tool_json(&answer).unwrap();
+        let items: Vec<_> = body["history"].as_array().unwrap().iter().map(remote_from_history).collect();
+        assert_eq!(items[0].media_type.as_deref(), Some("video"));
+        assert_eq!(items[0].url.as_deref(), Some("https://cdn/x.mp4"));
+        assert_eq!((items[0].width, items[0].height, items[0].seed), (Some(720), Some(1280), Some(7)));
+        assert_eq!(items[0].created_at, "2026-10-06T16:17:02Z");
+        assert_eq!(items[1].url, None, "unfinished: nothing to import");
+
+        let c = remote_from_creation(&json!({
+            "creation_id": "c1", "architecture": "mango", "model_id": "mango-v2", "type": "image",
+            "url": "https://cdn/c.png", "width": 1024, "height": 1024, "created_at": "2026-10-05T16:51:22.472Z",
+            "collections": [], "moderation": { "nsfw": true }, "prompt": "p"
+        }));
+        assert_eq!((c.kind.as_str(), c.status.as_str(), c.nsfw), ("saved", "completed", true));
+
+        // Text-only answers with a leading sentence, and refusals
+        let text = json!({ "content": [{ "type": "text", "text": "Found 1.\n\n{\"creations\": []}" }] });
+        assert!(tool_json(&text).unwrap()["creations"].is_array());
+        let refused = json!({ "isError": true, "content": [{ "type": "text", "text": "{\"error\":{\"message\":\"nope\"}}" }] });
+        assert_eq!(tool_json(&refused).unwrap_err(), "nope");
+        assert_eq!(normalize_time("2026-10-06T16:17:02.354Z"), "2026-10-06T16:17:02Z");
+    }
 
     #[test]
     fn finds_handles_and_skips_image_refs() {
@@ -1345,4 +1689,403 @@ mod tests {
         );
         assert!(mentioned_handles("no mentions, just 3@ symbols @ ").is_empty());
     }
+}
+
+// ── Import from Mage ────────────────────────────────────────────────────────
+//
+// Mage's MCP server lists the account's generations from the last 30 days
+// (`list_history`, including ones made in the Mage app) and the creations
+// saved there permanently (`search_creations`), each with its prompt and
+// model. Importing one adds a generation row that downloads like any other.
+
+/// One generation or saved creation on Mage, as the import panel shows it.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RemoteItem {
+    /// `history_id` or `creation_id`
+    pub remote_id: String,
+    /// "history" (last 30 days) or "saved"
+    pub kind: String,
+    /// Where it was made: app, api, mcp… (history only)
+    pub origin: Option<String>,
+    pub architecture: String,
+    pub model_id: Option<String>,
+    pub prompt: String,
+    pub created_at: String,
+    /// image, video or audio (unknown until finished)
+    pub media_type: Option<String>,
+    pub status: String,
+    pub url: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub seed: Option<i64>,
+    pub expires_at: Option<String>,
+    pub gems: Option<f64>,
+    #[serde(default)]
+    pub nsfw: bool,
+    #[serde(default)]
+    pub collections: Vec<String>,
+    /// Already in VideoVault (imported before, or made here through the API)
+    #[serde(default)]
+    pub imported: bool,
+    #[serde(skip_deserializing)]
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RemotePage {
+    pub items: Vec<RemoteItem>,
+    /// Pass back as `next` for the following page; none at the end
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteQuery {
+    /// "history" or "saved"
+    pub kind: String,
+    /// Saved only: search by meaning
+    pub query: Option<String>,
+    pub media_type: Option<String>,
+    pub next: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// Mage timestamps carry milliseconds; store them like ours, to the second.
+fn normalize_time(s: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|t| t.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|_| s.to_string())
+}
+
+/// A tool's JSON answer: `structuredContent`, else the JSON in its text.
+fn tool_json(result: &Value) -> Result<Value, String> {
+    let text: String = result["content"]
+        .as_array()
+        .map(|parts| parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"))
+        .unwrap_or_default();
+    if result["isError"].as_bool().unwrap_or(false) {
+        let msg = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+            .unwrap_or(text);
+        return Err(msg.trim().to_string());
+    }
+    if result["structuredContent"].is_object() {
+        return Ok(result["structuredContent"].clone());
+    }
+    // The text may lead with a sentence; take the JSON object after it
+    let start = text.find('{').ok_or("Unexpected answer from Mage")?;
+    serde_json::from_str(&text[start..]).map_err(|_| "Unexpected answer from Mage".to_string())
+}
+
+fn remote_from_history(v: &Value) -> RemoteItem {
+    let s = |k: &str| v[k].as_str().map(str::to_string);
+    let r = &v["result"];
+    RemoteItem {
+        remote_id: s("history_id").unwrap_or_default(),
+        kind: "history".into(),
+        origin: s("source"),
+        architecture: s("architecture").unwrap_or_default(),
+        model_id: s("model_id"),
+        prompt: s("prompt").unwrap_or_default(),
+        created_at: normalize_time(&s("created_at").unwrap_or_else(now)),
+        media_type: r["type"].as_str().map(str::to_string),
+        status: s("status").unwrap_or_default(),
+        url: r["url"].as_str().map(str::to_string),
+        width: r["width"].as_u64().map(|w| w as u32),
+        height: r["height"].as_u64().map(|h| h as u32),
+        seed: r["seed"].as_i64(),
+        expires_at: r["expires_at"].as_str().map(str::to_string),
+        gems: v["billing"]["gems"].as_f64(),
+        nsfw: r["moderation"]["nsfw"].as_bool().unwrap_or(false),
+        collections: vec![],
+        imported: false,
+        request_id: s("request_id"),
+    }
+}
+
+fn remote_from_creation(v: &Value) -> RemoteItem {
+    let s = |k: &str| v[k].as_str().map(str::to_string);
+    RemoteItem {
+        remote_id: s("creation_id").unwrap_or_default(),
+        kind: "saved".into(),
+        origin: None,
+        architecture: s("architecture").unwrap_or_default(),
+        model_id: s("model_id"),
+        prompt: s("prompt").unwrap_or_default(),
+        created_at: normalize_time(&s("created_at").unwrap_or_else(now)),
+        media_type: s("type"),
+        status: "completed".into(),
+        url: s("url"),
+        width: v["width"].as_u64().map(|w| w as u32),
+        height: v["height"].as_u64().map(|h| h as u32),
+        seed: None,
+        expires_at: None,
+        gems: None,
+        nsfw: v["moderation"]["nsfw"].as_bool().unwrap_or(false),
+        collections: v["collections"]
+            .as_array()
+            .map(|c| c.iter().filter_map(|x| x.as_str().or(x["name"].as_str()).map(str::to_string)).collect())
+            .unwrap_or_default(),
+        imported: false,
+        request_id: None,
+    }
+}
+
+/// One page of the account's Mage history (last 30 days) or saved creations.
+#[tauri::command]
+pub async fn mage_list_remote(q: RemoteQuery, app: AppHandle) -> Result<RemotePage, String> {
+    let client = client(&app)?;
+    let saved = q.kind == "saved";
+    let mut args = Map::new();
+    args.insert("limit".into(), json!(q.limit.unwrap_or(24).clamp(1, 50)));
+    if let Some(m) = q.media_type.as_deref().filter(|m| !m.is_empty()) {
+        args.insert("media_type".into(), json!(m));
+    }
+    if let Some(n) = q.next.as_deref().filter(|n| !n.is_empty()) {
+        if saved {
+            args.insert("offset".into(), json!(n.parse::<u64>().unwrap_or(0)));
+        } else {
+            args.insert("cursor".into(), json!(n));
+        }
+    }
+    if saved {
+        if let Some(query) = q.query.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            args.insert("query".into(), json!(query));
+        }
+    }
+    let args = Value::Object(args);
+    let tool = if saved { "search_creations" } else { "list_history" };
+    let result = client.call_tool(tool, |_| args.clone()).await.map_err(err)?;
+    let body = tool_json(&result)?;
+
+    let (mut items, next): (Vec<RemoteItem>, Option<String>) = if saved {
+        (
+            body["creations"].as_array().map(|l| l.iter().map(remote_from_creation).collect()).unwrap_or_default(),
+            body["next_offset"].as_u64().map(|n| n.to_string()).or_else(|| body["next_offset"].as_str().map(str::to_string)),
+        )
+    } else {
+        (
+            body["history"].as_array().map(|l| l.iter().map(remote_from_history).collect()).unwrap_or_default(),
+            body["next_cursor"].as_str().map(str::to_string),
+        )
+    };
+
+    // Mark what's already here: imported before, or made here through the API
+    let (remote_ids, request_ids): (std::collections::HashSet<String>, std::collections::HashSet<String>) =
+        with_conn(&app, |conn| {
+            let ids = conn
+                .prepare("SELECT remote_id FROM mage_generations WHERE remote_id IS NOT NULL")?
+                .query_map([], |r| r.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            let reqs = conn
+                .prepare("SELECT request_id FROM mage_generations WHERE request_id IS NOT NULL")?
+                .query_map([], |r| r.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok((ids, reqs))
+        })?;
+    for item in items.iter_mut() {
+        item.imported = remote_ids.contains(&item.remote_id)
+            || item.request_id.as_ref().is_some_and(|r| request_ids.contains(r));
+    }
+    Ok(RemotePage { items, next })
+}
+
+/// Add Mage generations/creations to the gallery and download them into the
+/// Mage folder (videos also go to the library, tagged with their @mentions).
+/// Items already imported are skipped.
+#[tauri::command]
+pub async fn mage_import_remote(items: Vec<RemoteItem>, app: AppHandle) -> Result<Vec<Generation>, String> {
+    let mut ids = Vec::new();
+    for item in items {
+        let Some(url) = item.url.clone() else { continue };
+        let media_type = item.media_type.clone().unwrap_or_else(|| "image".into());
+        let id = Uuid::new_v4().to_string();
+        let mut config = json!({ "prompt": item.prompt });
+        if let Some(m) = &item.model_id {
+            config["model_id"] = json!(m);
+        }
+        let inserted = with_conn(&app, |conn| {
+            let exists: bool = conn
+                .query_row("SELECT 1 FROM mage_generations WHERE remote_id = ?1", params![item.remote_id], |_| Ok(true))
+                .optional()?
+                .unwrap_or(false);
+            if exists {
+                return Ok(false);
+            }
+            conn.execute(
+                "INSERT INTO mage_generations
+                 (id, idempotency_key, architecture, model_id, media_type, prompt, config_json, inputs_json,
+                  status, gems_charged, seed, result_url, result_expires_at, width, height,
+                  created_at, updated_at, remote_id, origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '{}', 'downloading', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                params![
+                    id, Uuid::new_v4().to_string(), item.architecture, item.model_id, media_type, item.prompt,
+                    config.to_string(), item.gems, item.seed, url, item.expires_at, item.width, item.height,
+                    item.created_at, now(), item.remote_id, item.origin.clone().or(Some(item.kind.clone())),
+                ],
+            )?;
+            Ok(true)
+        })?;
+        if inserted {
+            spawn_drive(app.clone(), id.clone());
+            ids.push(id);
+        }
+    }
+    ids.iter().map(|id| load_generation(&app, id)).collect()
+}
+
+// ── Website runs (Unlimited mode) ───────────────────────────────────────────
+//
+// The API only generates on Gems; Unlimited mode is website-only. To carry
+// reference images there, each one is saved as a temporary Mage reference
+// whose @handle goes into the copied prompt (saving references is free).
+
+#[derive(Debug, Serialize)]
+pub struct WebsiteRun {
+    /// One @handle per reference image, in order (`@image1` → handles[0])
+    pub handles: Vec<String>,
+    /// A folder holding copies of the first/last frames to drag onto the site
+    pub frames_folder: Option<String>,
+}
+
+fn temp_handle(n: usize) -> String {
+    let suffix: String = Uuid::new_v4().simple().to_string().chars().take(4).collect();
+    format!("vvimg{}-{}", n, suffix)
+}
+
+/// Save each reference image as a temporary Mage reference and put the
+/// frames in a folder ready to drag onto the website.
+#[tauri::command]
+pub async fn mage_prepare_website_run(
+    reference_paths: Vec<String>,
+    frame_paths: Vec<(String, String)>,
+    app: AppHandle,
+) -> Result<WebsiteRun, String> {
+    let client = client(&app)?;
+    let mut handles = Vec::new();
+    for (i, path) in reference_paths.iter().enumerate() {
+        let image = resolve_input(&app, &client, path).await?;
+        let mut created = None;
+        // A taken handle (409) just needs another suffix
+        for _ in 0..3 {
+            let body = json!({
+                "name": format!("VideoVault temp {}", i + 1),
+                "handle": temp_handle(i + 1),
+                "kind": "object",
+                "image": image,
+                "description": "Temporary: carries a VideoVault image into a website run. Removed by Clean up.",
+            });
+            match client.create_entity("references", &body).await {
+                Ok(v) => { created = Some(v); break; }
+                Err(e) if e.downcast_ref::<ApiError>().map(|a| a.status == 409).unwrap_or(false) => continue,
+                Err(e) => return Err(err(e)),
+            }
+        }
+        let v = created.ok_or("Could not find a free handle for a temporary reference")?;
+        let entity = entity_from_json(&v, "reference");
+        with_conn(&app, |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO mage_temp_refs (id, handle, created_at) VALUES (?1, ?2, ?3)",
+                params![entity.id, entity.handle, now()],
+            )
+        })?;
+        handles.push(entity.handle);
+    }
+
+    // Frames: copies named by role, in a fresh folder to drag from
+    let frames_folder = if frame_paths.is_empty() {
+        None
+    } else {
+        let dir = app
+            .path()
+            .app_cache_dir()
+            .map_err(|e| e.to_string())?
+            .join("website-run");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        for (role, path) in &frame_paths {
+            let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("png");
+            std::fs::copy(path, dir.join(format!("{}.{}", role, ext))).map_err(|e| e.to_string())?;
+        }
+        Some(dir.to_string_lossy().to_string())
+    };
+    Ok(WebsiteRun { handles, frames_folder })
+}
+
+/// How many temporary references are waiting to be cleaned up.
+#[tauri::command]
+pub async fn mage_temp_ref_count(app: AppHandle) -> Result<u32, String> {
+    with_conn(&app, |conn| conn.query_row("SELECT COUNT(*) FROM mage_temp_refs", [], |r| r.get(0)))
+}
+
+/// Delete the temporary references from Mage (any already gone count too).
+#[tauri::command]
+pub async fn mage_cleanup_temp_refs(app: AppHandle) -> Result<u32, String> {
+    let client = client(&app)?;
+    let ids: Vec<String> = with_conn(&app, |conn| {
+        conn.prepare("SELECT id FROM mage_temp_refs")?.query_map([], |r| r.get(0))?.collect()
+    })?;
+    let mut removed = 0;
+    for id in ids {
+        match client.delete_entity("references", &id).await {
+            Ok(()) => {}
+            Err(e) if e.downcast_ref::<ApiError>().map(|a| a.status == 404).unwrap_or(false) => {}
+            Err(e) => return Err(format!("Removed {}, then: {}", removed, err(e))),
+        }
+        with_conn(&app, |conn| conn.execute("DELETE FROM mage_temp_refs WHERE id = ?1", params![id]))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+/// Give older generations the input copies new ones get: for each one whose
+/// inputs still point at originals that exist, copy them into the
+/// `_inputs` folder beside its result and point Remix at the copies.
+/// Runs at startup; generations already done are skipped.
+pub fn backfill_input_copies(app: AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let rows: Vec<(String, String, String, Option<String>, String)> = match with_conn(&app, |conn| {
+            conn.prepare(
+                "SELECT id, architecture, created_at, local_path, inputs_json FROM mage_generations
+                 WHERE inputs_json IS NOT NULL AND inputs_json NOT IN ('{}', 'null', '')",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+            .collect()
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                log::warn!("Input back-fill skipped: {}", e);
+                return;
+            }
+        };
+        let mut updated = 0;
+        for (id, architecture, created_at, local_path, inputs_json) in rows {
+            let inputs: Value = serde_json::from_str(&inputs_json).unwrap_or(Value::Null);
+            // Beside the actual result file when there is one (older results
+            // were named by download time), else by the creation time
+            let base = local_path
+                .as_deref()
+                .and_then(|p| Path::new(p).file_stem())
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| file_base(&created_at, &architecture, &id));
+            let kept = keep_input_copies(&app, &base, &inputs);
+            if kept != inputs {
+                let saved = with_conn(&app, |conn| {
+                    conn.execute(
+                        "UPDATE mage_generations SET inputs_json = ?1 WHERE id = ?2",
+                        params![kept.to_string(), id],
+                    )
+                });
+                if saved.is_ok() {
+                    updated += 1;
+                    emit_generation(&app, &id);
+                }
+            }
+        }
+        if updated > 0 {
+            log::info!("Kept input copies for {} earlier generation(s)", updated);
+        }
+    });
 }

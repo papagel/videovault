@@ -48,8 +48,8 @@ interface UIState {
   /** A one-click 8-second mix in progress (0–1), or its error */
   quickMixStatus: { progress: number; error?: undefined } | { progress?: undefined; error: string } | null
   setQuickMixStatus: (s: AppStore['quickMixStatus']) => void
-  /** Video waiting for a character to be picked for "Merge with intro" */
-  introPickVideo: { video: VideoFile; preferHandles: string[] } | null
+  /** Videos waiting for a character to be picked for "Merge with intro" */
+  introPickVideo: { videos: VideoFile[]; preferHandles: string[] } | null
   showTrimModal: boolean
   showTagModal: boolean
   showSettingsModal: boolean
@@ -150,7 +150,7 @@ interface AppStore extends PlayerState, UIState, DataState, MageState {
   setScanning: (v: boolean, progress?: UIState['scanProgress']) => void
   setShowMergeModal: (v: boolean) => void
   openMergePreset: (preset: MergePreset) => void
-  setIntroPickVideo: (v: { video: VideoFile; preferHandles: string[] } | null) => void
+  setIntroPickVideo: (v: { videos: VideoFile[]; preferHandles: string[] } | null) => void
   setShowTrimModal: (v: boolean) => void
   setShowTagModal: (v: boolean) => void
   setShowSettingsModal: (v: boolean) => void
@@ -221,6 +221,7 @@ const defaultSettings: AppSettings = {
   mageThumbFit: 'cover',
   mageTrashOnRemove: false,
   mergeQuality: 'high',
+  mageWebsiteBrowser: 'Brave Browser',
 }
 
 export const useStore = create<AppStore>()(

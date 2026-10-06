@@ -201,10 +201,13 @@ export function ContextMenu({ video, x, y, onClose }: ContextMenuProps) {
 
       <MenuItem
         icon={<Film size={13} />}
-        label="Merge with intro…"
-        title="Put a character's intro on top of this video (8-second mix)"
+        label={isSelected && selectedCount > 1 ? `Merge ${selectedCount} videos with intro…` : 'Merge with intro…'}
+        title="Put a character's intro on top (8-second mix)"
         onClick={() => {
-          useStore.getState().setIntroPickVideo({ video, preferHandles: [] })
+          // Right-clicking one of several selected videos acts on all of them
+          const s = useStore.getState()
+          const targets = isSelected && selectedCount > 1 ? s.videos.filter((v) => s.selectedVideoIds.has(v.id)) : [video]
+          s.setIntroPickVideo({ videos: targets, preferHandles: [] })
           onClose()
         }}
       />

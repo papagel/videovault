@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import {
   Loader2, AlertTriangle, Ban, RotateCcw, Shuffle, FolderOpen, Trash2,
-  ImagePlus, Clapperboard, UserPlus, Gem, X, Square, Play, Crop, Maximize2, Search, Film,
+  ImagePlus, Clapperboard, UserPlus, Gem, X, Square, Play, Crop, Maximize2, Search, Film, CloudDownload,
 } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '@/store'
@@ -11,6 +11,7 @@ import { cn, getThumbnailSrc, getVideoSrc } from '@/lib/utils'
 import { FINAL_STATUSES, isRetryable, mentionedHandles, remixGeneration, shortTime, statusLabel } from '@/lib/mage'
 import { videoForGeneration } from '@/lib/intro'
 import { DRAG_MIME } from './StudioPanel'
+import { ImportPanel } from './ImportPanel'
 import type { MageGeneration, MageThumbSize } from '@/types'
 
 type Filter = 'all' | 'image' | 'video'
@@ -33,6 +34,7 @@ export function GenerationGallery() {
   const [filter, setFilter] = useState<Filter>('all')
   const [query, setQuery] = useState('')
   const [viewing, setViewing] = useState<MageGeneration | null>(null)
+  const [importOpen, setImportOpen] = useState(false)
 
   const shown = useMemo(() => {
     const words = query.toLowerCase().split(/\s+/).filter(Boolean)
@@ -74,6 +76,13 @@ export function GenerationGallery() {
         />
         <span className="text-[11px] text-[#55556a] tabular-nums">{shown.length}</span>
         <div className="flex-1" />
+        <button
+          onClick={() => setImportOpen(true)}
+          className="flex items-center gap-1.5 text-[11px] text-[#8888aa] hover:text-white bg-[#16161f] border border-[#2a2a3a] hover:border-[#3a3a5a] rounded-lg px-2 py-1"
+          title="Import generations made on Mage (website included), with prompts and references"
+        >
+          <CloudDownload size={12} /> Import from Mage
+        </button>
         <button
           onClick={() => updateSettings({ mageThumbFit: thumbFit === 'cover' ? 'contain' : 'cover' })}
           className="p-1.5 rounded-lg border border-[#2a2a3a] bg-[#16161f] text-[#8888aa] hover:text-white"
@@ -137,6 +146,7 @@ export function GenerationGallery() {
       </div>
 
       {viewing && <Viewer g={viewing} onClose={() => setViewing(null)} />}
+      {importOpen && <ImportPanel onClose={() => setImportOpen(false)} />}
     </div>
   )
 }
@@ -215,7 +225,7 @@ function GenerationCard({
   const makeCharacter = act(async () => setEntityModal({ type: 'character', filePath: g.local_path! }))
   const mergeWithIntro = act(async () => {
     const video = await videoForGeneration(g)
-    if (video) useStore.getState().setIntroPickVideo({ video, preferHandles: mentionedHandles(g.prompt) })
+    if (video) useStore.getState().setIntroPickVideo({ videos: [video], preferHandles: mentionedHandles(g.prompt) })
   })
 
   return (

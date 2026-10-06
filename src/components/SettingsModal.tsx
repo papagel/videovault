@@ -100,6 +100,16 @@ export function SettingsModal() {
 }
 
 /** API key (kept in the Keychain) and the folder generations download to. */
+/** Browser apps for opening the Mage website ('' = the default browser) */
+const BROWSERS = [
+  { value: 'Brave Browser', label: 'Brave' },
+  { value: 'Google Chrome', label: 'Chrome' },
+  { value: 'Safari', label: 'Safari' },
+  { value: 'Firefox', label: 'Firefox' },
+  { value: 'Arc', label: 'Arc' },
+  { value: '', label: 'Default browser' },
+]
+
 /** mageConfirmGems: 0 always asks, -1 never does */
 const CONFIRM_OPTIONS = [
   { value: 0, label: 'Every time' },
@@ -111,6 +121,7 @@ function MageSettings() {
   const { mageConfig, setMageConfig, mageBalance, setMageBalance, updateSettings } = useStore()
   const confirmGems = useStore((s) => s.settings.mageConfirmGems)
   const trashOnRemove = useStore((s) => s.settings.mageTrashOnRemove)
+  const websiteBrowser = useStore((s) => s.settings.mageWebsiteBrowser)
 
   const setAddToLibrary = async (enabled: boolean) => {
     await invoke('mage_set_add_to_library', { enabled }).catch(console.error)
@@ -230,6 +241,20 @@ function MageSettings() {
             </p>
           </div>
           <Toggle checked={trashOnRemove} onChange={(v) => updateSettings({ mageTrashOnRemove: v })} />
+        </div>
+
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-sm text-[#e8e8f0]">Open Mage website in</p>
+            <p className="text-xs text-[#55556a]">For “Run on website (unlimited)”</p>
+          </div>
+          <select
+            value={websiteBrowser}
+            onChange={(e) => updateSettings({ mageWebsiteBrowser: e.target.value })}
+            className="flex-shrink-0 bg-[#111118] border border-[#2a2a3a] focus:border-[#6366f1] rounded-lg px-2 py-1.5 text-xs text-[#e8e8f0] outline-none"
+          >
+            {BROWSERS.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
+          </select>
         </div>
 
         <div className="flex items-center justify-between gap-3">

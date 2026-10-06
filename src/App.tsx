@@ -19,7 +19,7 @@ import { UndoToast } from '@/components/UndoToast'
 import { CreateView } from '@/components/create/CreateView'
 import { EntityModal } from '@/components/create/EntityModal'
 import { refreshMageBalance } from '@/lib/mage'
-import type { Tag, Collection, ScanProgress, MageGeneration } from '@/types'
+import type { Tag, Collection, ScanProgress, MageGeneration, MageConfig } from '@/types'
 
 const AppWrapper = () => {
   // Deliberately NOT subscribing to `videos` or `hoveredVideoId` here: both
@@ -190,6 +190,8 @@ const AppWrapper = () => {
         setCollections(collections)
         setWatchedFolders(folders)
         useStore.getState().setVideos(allVideos)
+        // Where the Mage folder is (merges of its videos go to Mage/Merged)
+        invoke<MageConfig>('mage_get_config').then((c) => useStore.getState().setMageConfig(c)).catch(console.warn)
         invoke('get_video_stats')
           .then((stats: any) => setStats(stats))
           .catch(console.error)

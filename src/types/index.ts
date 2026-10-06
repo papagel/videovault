@@ -47,6 +47,8 @@ export interface AppSettings {
   mageTrashOnRemove: boolean
   /** Merge output: close to the source, or smaller files */
   mergeQuality: 'high' | 'small'
+  /** Browser app for "Run on website" (empty: the default browser) */
+  mageWebsiteBrowser: string
 }
 
 export type MageThumbSize = 'xs' | 'sm' | 'md' | 'lg' | 'xl'
@@ -137,6 +139,37 @@ export interface MageGeneration {
   video_id: string | null
   created_at: string
   updated_at: string
+  /** Mage's id, for generations imported from Mage */
+  remote_id: string | null
+  /** Where an imported generation was made: app, api, mcp, saved… */
+  origin: string | null
+}
+
+/** A generation (last 30 days) or saved creation on Mage, for importing */
+export interface MageRemoteItem {
+  remote_id: string
+  kind: 'history' | 'saved'
+  origin: string | null
+  architecture: string
+  model_id: string | null
+  prompt: string
+  created_at: string
+  media_type: 'image' | 'video' | 'audio' | null
+  status: string
+  url: string | null
+  width: number | null
+  height: number | null
+  seed: number | null
+  expires_at: string | null
+  gems: number | null
+  nsfw: boolean
+  collections: string[]
+  imported: boolean
+}
+
+export interface MageRemotePage {
+  items: MageRemoteItem[]
+  next: string | null
 }
 
 export type MageReferenceKind = 'object' | 'location' | 'pose' | 'outfit' | 'audio'

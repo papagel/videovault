@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
-  Image as ImageIcon, Film, Plus, X, Gem, Loader2, AlertTriangle, ChevronDown, User, Shapes, Music,
+  Image as ImageIcon, Film, Plus, X, Gem, Loader2, AlertTriangle, ChevronDown, User, Shapes, Music, Globe,
 } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '@/store'
@@ -542,8 +542,155 @@ function StudioForm({
                   ? `Couldn't check the exact price; ~${Math.round(arch.gems)} is the default-settings price`
                   : `~${Math.round(arch.gems)} gems at default settings`}
         </p>
+        <RunOnWebsite
+          prompt={draft.prompt.trim()}
+          modelLabel={`${arch.name}${variants.length > 1 && modelId ? ` (${modelId})` : ''}`}
+          settings={fields.map(({ field, tokens }) => `${fieldLabel(field)} ${tokenLabel(field, valueOf(field, tokens))}`)}
+          referencePaths={references}
+          supportsReferences={mentions.references || mentions.characters}
+          frames={[
+            ...(firstField && draft.firstFrame ? [['first-frame', draft.firstFrame] as [string, string]] : []),
+            ...(lastField && draft.lastFrame ? [['last-frame', draft.lastFrame] as [string, string]] : []),
+          ]}
+        />
       </div>
     </PanelShell>
+  )
+}
+
+// ── Run on the website (unlimited mode) ─────────────────────────────────────
+
+const MAGE_WEBSITE = 'https://www.mage.space'
+
+/**
+ * Mage's API and MCP only generate on Gems; the slower, free Unlimited mode
+ * exists only on the website. Reference images go along as temporary Mage
+ * references whose @handles replace @image1… in the copied prompt; frames are
+ * put in a Finder folder to drag in; settings are listed to pick by hand.
+ * The result comes back through Import from Mage.
+ */
+function RunOnWebsite({
+  prompt, modelLabel, settings, referencePaths, supportsReferences, frames,
+}: {
+  prompt: string
+  modelLabel: string
+  settings: string[]
+  referencePaths: string[]
+  supportsReferences: boolean
+  /** [role, path]: first-frame / last-frame */
+  frames: [string, string][]
+}) {
+  const [note, setNote] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [tempCount, setTempCount] = useState(0)
+  const [cleaning, setCleaning] = useState(false)
+
+  const refreshCount = () => invoke<number>('mage_temp_ref_count').then(setTempCount).catch(() => {})
+  useEffect(() => { refreshCount() }, [])
+
+  const copy = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      // Older webviews: copy through a hidden textarea
+      const ta = document.createElement('textarea')
+      ta.value = text
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      ta.remove()
+    }
+  }
+
+  const run = async () => {
+    setBusy(true)
+    setNote(null)
+    try {
+      const carryRefs = supportsReferences ? referencePaths : []
+      const prep = carryRefs.length || frames.length
+        ? await invoke<{ handles: string[]; frames_folder: string | null }>('mage_prepare_website_run', {
+            referencePaths: carryRefs,
+            framePaths: frames,
+          })
+        : { handles: [], frames_folder: null }
+
+      // @image1… become the temporary references; unmentioned ones are added
+      let text = prompt.replace(/@image(\d+)(?![a-z0-9_-])/gi, (m, n) => {
+        const h = prep.handles[Number(n) - 1]
+        return h ? `@${h}` : m
+      })
+      const unmentioned = prep.handles.filter((_, i) => !new RegExp(`@image${i + 1}(?![a-z0-9_-])`, 'i').test(prompt))
+      if (unmentioned.length) text = `${text}${/\s$/.test(text) ? '' : ' '}${unmentioned.map((h) => `@${h}`).join(' ')}`
+      await copy(text)
+
+      const browser = useStore.getState().settings.mageWebsiteBrowser
+      await invoke('open_url_in', { url: MAGE_WEBSITE, browser: browser || null }).catch(console.error)
+      if (prep.frames_folder) await invoke('reveal_in_finder', { path: prep.frames_folder }).catch(console.error)
+
+      const parts = [
+        prep.handles.length
+          ? `Prompt copied with your ${prep.handles.length} reference image${prep.handles.length > 1 ? 's' : ''} as ${prep.handles.map((h) => `@${h}`).join(', ')}.`
+          : 'Prompt copied.',
+        `On Mage, pick ${modelLabel}${settings.length ? ` · ${settings.join(' · ')}` : ''} and paste the prompt.`,
+        prep.frames_folder ? `Drag the ${frames.map(([r]) => r.replace('-', ' ')).join(' and ')} from the Finder window that opened.` : '',
+        !supportsReferences && referencePaths.length
+          ? `This model doesn't take references, so add the ${referencePaths.length} image${referencePaths.length > 1 ? 's' : ''} on the website by hand.`
+          : '',
+        'Generate in Unlimited mode, then use Import from Mage → Recent.',
+      ]
+      setNote(parts.filter(Boolean).join(' '))
+    } catch (e) {
+      setNote(`Couldn't prepare the website run: ${e}`)
+    } finally {
+      setBusy(false)
+      refreshCount()
+    }
+  }
+
+  const cleanUp = async () => {
+    setCleaning(true)
+    try {
+      const n = await invoke<number>('mage_cleanup_temp_refs')
+      setNote(`Removed ${n} temporary reference${n === 1 ? '' : 's'} from Mage.`)
+    } catch (e) {
+      setNote(String(e))
+    } finally {
+      setCleaning(false)
+      refreshCount()
+    }
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <button
+        onClick={run}
+        disabled={!prompt || busy}
+        title="Copy the prompt (reference images go along as temporary Mage references) and open the Mage website, where Unlimited mode generates without Gems"
+        className="w-full flex items-center justify-center gap-1.5 py-1.5 text-[11px] text-[#8888aa] hover:text-white bg-[#16161f] border border-[#2a2a3a] hover:border-[#3a3a5a] disabled:opacity-40 rounded-lg transition-all"
+      >
+        {busy ? <Loader2 size={12} className="animate-spin" /> : <Globe size={12} />}
+        {busy ? 'Preparing references…' : 'Run on website (unlimited, no Gems)'}
+      </button>
+      {note && (
+        <p className="flex items-start gap-1.5 text-[10px] leading-relaxed text-[#8888aa] bg-[#16161f] border border-[#2a2a3a] rounded-lg px-2.5 py-2">
+          <span className="flex-1 break-words">{note}</span>
+          <button onClick={() => setNote(null)} className="text-[#55556a] hover:text-white flex-shrink-0"><X size={11} /></button>
+        </p>
+      )}
+      {tempCount > 0 && (
+        <p className="flex items-center justify-between text-[10px] text-[#55556a]">
+          <span>{tempCount} temporary reference{tempCount === 1 ? '' : 's'} on Mage</span>
+          <button
+            onClick={cleanUp}
+            disabled={cleaning}
+            className="text-[#6366f1] hover:text-[#7c7ff5] disabled:opacity-50"
+            title="Delete them from your Mage account once the website generation has started"
+          >
+            {cleaning ? 'Cleaning up…' : 'Clean up'}
+          </button>
+        </p>
+      )}
+    </div>
   )
 }
 

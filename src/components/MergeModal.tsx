@@ -8,7 +8,7 @@ import {
 import { useStore } from '@/store'
 import { cn, formatDuration, formatFileSize, getThumbnailSrc, getVideoSrc } from '@/lib/utils'
 import { isFileClip } from '@/lib/intro'
-import { MIX_SPLITS, MIX_TOTAL, type BigPart } from '@/lib/merge'
+import { INTRO_SPLIT_INDEX, MIX_SPLITS, MIX_TOTAL, type BigPart } from '@/lib/merge'
 import type { MergePreset, VideoFile } from '@/types'
 
 interface Clip {
@@ -74,8 +74,8 @@ export function MergeModal() {
       setPreset(p)
       if (p) {
         // Intro merge: intro on top, the 8-second mix on from the start
-        setClips(mixClips(p.clips.map((video) => ({ video, trimSecs: 0 })), MIX_SPLITS[0], 'end', p.introFirst))
-        setMix(0)
+        setClips(mixClips(p.clips.map((video) => ({ video, trimSecs: 0 })), MIX_SPLITS[INTRO_SPLIT_INDEX], 'end', p.introFirst))
+        setMix(INTRO_SPLIT_INDEX)
       } else {
         setClips(
           videos
@@ -358,7 +358,12 @@ export function MergeModal() {
   if (!showMergeModal) return null
 
   const initialFolder = preset ? undefined : useStore.getState().activeFolders[0]
-  const mergeFolder = preset?.outputFolder ?? initialFolder ?? clips[0]?.video.folder
+  // Merges of Mage videos go to Mage/Merged (the backend decides the same)
+  const mageRoot = useStore.getState().mageConfig?.output_dir
+  const mageMerged = !!mageRoot && clips.some((c) => c.video.path.startsWith(mageRoot + '/'))
+    ? `${mageRoot}/Merged`
+    : undefined
+  const mergeFolder = mageMerged ?? preset?.outputFolder ?? initialFolder ?? clips[0]?.video.folder
 
   const merging = progress !== null && !done
 
@@ -721,7 +726,7 @@ export function MergeModal() {
           {mergeFolder && (
             <p className="mb-2 text-[11px] text-[#55556a] truncate" title={mergeFolder}>
               Saves to <span className="text-[#8888aa]">{mergeFolder.split('/').pop()}/video_merge_NN.mp4</span>
-              {preset ? ' (next to the video)' : initialFolder ? ' (the first folder you opened)' : ''}
+              {mageMerged ? ' (Mage videos are merged into Mage/Merged)' : preset ? ' (next to the video)' : initialFolder ? ' (the first folder you opened)' : ''}
               {' '}· next free number
             </p>
           )}

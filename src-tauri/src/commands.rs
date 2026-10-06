@@ -1212,11 +1212,18 @@ pub async fn merge_videos(
     }
     drop(conn);
 
+    // Merges of Mage videos go to Mage/Merged; others where the UI said
+    let auto_name = request.output_filename.as_deref().map(str::trim).filter(|f| !f.is_empty()).is_none();
+    let clip_paths: Vec<String> = inputs.iter().map(|i| i.path.clone()).collect();
+    let output_folder = (auto_name)
+        .then(|| crate::mage_commands::merged_dir_for(&app, &clip_paths))
+        .flatten()
+        .unwrap_or_else(|| request.output_folder.clone());
     let filename = match request.output_filename.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
         Some(f) => f.to_string(),
-        None => next_merge_name(Path::new(&request.output_folder)),
+        None => next_merge_name(Path::new(&output_folder)),
     };
-    let output_path = format!("{}/{}", request.output_folder.trim_end_matches('/'), filename);
+    let output_path = format!("{}/{}", output_folder.trim_end_matches('/'), filename);
     let app_clone = app.clone();
 
     tokio::task::block_in_place(|| {
@@ -1863,4 +1870,28 @@ pub async fn index_video_path(
         .map_err(|_| format!("Could not add {} to the library", path))?
     };
     get_video_by_id_internal(&*db, &id).map_err(|e| e.to_string())
+}
+
+/// Open a web link in a particular browser (e.g. "Brave Browser"), or the
+/// default one when `browser` is empty or isn't installed.
+#[tauri::command]
+pub async fn open_url_in(url: String, browser: Option<String>) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("Only web links can be opened".into());
+    }
+    if let Some(app) = browser.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        let ok = std::process::Command::new("open")
+            .args(["-a", app, &url])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Ok(());
+        }
+    }
+    std::process::Command::new("open")
+        .arg(&url)
+        .status()
+        .map_err(|e| e.to_string())
+        .and_then(|s| if s.success() { Ok(()) } else { Err(format!("Could not open {}", url)) })
 }

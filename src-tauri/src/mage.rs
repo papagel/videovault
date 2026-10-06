@@ -22,7 +22,29 @@ fn keychain_entry() -> Result<keyring::Entry> {
 }
 
 pub fn load_api_key() -> Option<String> {
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    if let Some(key) = load_via_security_tool() {
+        return Some(key);
+    }
     keychain_entry().ok()?.get_password().ok()
+}
+
+/// Dev builds only: read the key through Apple's `security` tool. macOS ties
+/// Keychain access to the reading app's build, and every dev rebuild is a new
+/// build, so reading it directly asked again after each rebuild. `security`
+/// never changes: one "Always Allow" for it lasts. Release builds read the
+/// Keychain directly.
+#[cfg(all(debug_assertions, target_os = "macos"))]
+fn load_via_security_tool() -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_USER, "-w"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let key = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!key.is_empty()).then_some(key)
 }
 
 pub fn store_api_key(key: &str) -> Result<()> {
@@ -412,28 +434,30 @@ impl Client {
 
     /// The exact gem price of a generation, without charging anything.
     /// `config` is the full request body, media fields already as URLs.
-    pub async fn estimate_cost(&self, architecture: &str, config: &Value) -> Result<Estimate> {
+    async fn session(&self) -> Result<McpSession> {
+        let mut guard = mcp_session().lock().await;
+        if let Some(s) = guard.as_ref() {
+            return Ok(s.clone());
+        }
+        let s = self.open_mcp_session().await?;
+        *guard = Some(s.clone());
+        Ok(s)
+    }
+
+    /// Call any MCP tool; `args` may be built from the session's schemas.
+    /// Returns the raw `tools/call` result (`content`, `structuredContent`,
+    /// `isError`).
+    pub async fn call_tool(&self, name: &str, args: impl Fn(&McpTools) -> Value) -> Result<Value> {
         for attempt in 0..2 {
-            let session = {
-                let mut guard = mcp_session().lock().await;
-                match guard.as_ref() {
-                    Some(s) => s.clone(),
-                    None => {
-                        let s = self.open_mcp_session().await?;
-                        *guard = Some(s.clone());
-                        s
-                    }
-                }
-            };
-            let args = estimate_args(&session.estimate_schema, architecture, config);
+            let session = self.session().await?;
             let body = json!({
                 "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                "params": { "name": "estimate_cost", "arguments": args },
+                "params": { "name": name, "arguments": args(&McpTools(&session)) },
             });
             match self.mcp_post(session.id.as_deref(), &body).await {
                 Ok((_, result)) => {
-                    log::debug!("Mage estimate_cost result: {}", result);
-                    return Ok(parse_estimate(&result));
+                    log::debug!("Mage {} result: {}", name, result);
+                    return Ok(result);
                 }
                 // An expired session answers 404 (or 400): open a new one once.
                 Err(e) if attempt == 0
@@ -446,7 +470,24 @@ impl Client {
         }
         unreachable!()
     }
+
+    pub async fn estimate_cost(&self, architecture: &str, config: &Value) -> Result<Estimate> {
+        let result = self
+            .call_tool("estimate_cost", |t| estimate_args(t.0.estimate_schema(), architecture, config))
+            .await?;
+        Ok(parse_estimate(&result))
+    }
 }
+
+/// The open session's tool schemas, for shaping arguments.
+pub struct McpTools<'a>(&'a McpSession);
+
+impl McpSession {
+    fn estimate_schema(&self) -> &Value {
+        &self.estimate_schema
+    }
+}
+
 
 /// Shape the tool arguments after its schema: `{architecture, config}` as
 /// Mage's skills describe it, adapting to other names if the schema uses them.

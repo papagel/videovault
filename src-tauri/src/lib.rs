@@ -79,8 +79,13 @@ pub fn run() {
             app.manage(watcher_state);
             app.manage(MageKeyState(Mutex::new(None)));
 
+            // Older flat Mage folders are sorted into sections once
+            mage_commands::reorganize_mage_folder(app.handle());
+
             // Resume Mage generations that were in flight when the app quit
             mage_commands::resume_pending(app.handle().clone());
+            // Copies of earlier generations' input images (once; then a no-op)
+            mage_commands::backfill_input_copies(app.handle().clone());
 
             Ok(())
         })
@@ -137,9 +142,15 @@ pub fn run() {
             mage_commands::mage_estimate_cost,
             mage_commands::mage_set_add_to_library,
             mage_commands::mage_set_entity_intro,
+            mage_commands::mage_list_remote,
+            mage_commands::mage_import_remote,
+            mage_commands::mage_prepare_website_run,
+            mage_commands::mage_temp_ref_count,
+            mage_commands::mage_cleanup_temp_refs,
             mage_commands::mage_clear_entity_intro,
             commands::probe_media,
             commands::index_video_path,
+            commands::open_url_in,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

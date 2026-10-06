@@ -3,7 +3,7 @@ import { useShallow } from 'zustand/react/shallow'
 import {
   Grid3X3, List, Merge,
   Scissors, Tag, Trash2, SortAsc, SortDesc, ChevronDown,
-  PanelLeftClose, PanelLeft, Library, Sparkles, Gem, Loader2, Timer,
+  PanelLeftClose, PanelLeft, Library, Sparkles, Gem, Loader2, Timer, Film,
 } from 'lucide-react'
 import { FolderPicker } from './FolderPicker'
 import { MIX_SPLITS, mixProblem, quickMix, splitLabel } from '@/lib/merge'
@@ -135,6 +135,14 @@ export function Toolbar() {
             <ToolbarActionButton onClick={() => setShowMergeModal(true)} title="Merge" icon={<Merge size={13} />} />
           )}
           {selectedCount === 2 && <QuickMix />}
+          <ToolbarActionButton
+            onClick={() => {
+              const st = useStore.getState()
+              st.setIntroPickVideo({ videos: st.videos.filter((v) => st.selectedVideoIds.has(v.id)), preferHandles: [] })
+            }}
+            title={selectedCount > 1 ? `Merge ${selectedCount} videos with an intro` : 'Merge with intro'}
+            icon={<Film size={13} />}
+          />
           {selectedCount === 1 && (
             <ToolbarActionButton onClick={() => setShowTrimModal(true)} title="Trim" icon={<Scissors size={13} />} />
           )}

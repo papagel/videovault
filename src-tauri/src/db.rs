@@ -119,6 +119,15 @@ fn create_tables(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL
         );
 
+        -- References VideoVault saved on Mage only to carry images into a
+        -- website run (@handle in a copied prompt); removed by Clean up and
+        -- kept out of the characters/references list.
+        CREATE TABLE IF NOT EXISTS mage_temp_refs (
+            id TEXT PRIMARY KEY,
+            handle TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
         -- A local intro video per character/reference (never sent to Mage).
         -- Separate from mage_entities, which a sync rewrites.
         CREATE TABLE IF NOT EXISTS mage_entity_intros (
@@ -138,6 +147,16 @@ fn create_tables(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_video_tags_tag ON video_tags(tag_id);
         ",
     )?;
+    // Columns added after the first release (ignored when already there):
+    // generations imported from Mage remember their Mage id and where they
+    // were made (app, api, mcp…)
+    for sql in [
+        "ALTER TABLE mage_generations ADD COLUMN remote_id TEXT",
+        "ALTER TABLE mage_generations ADD COLUMN origin TEXT",
+    ] {
+        let _ = conn.execute(sql, []);
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_mage_generations_remote ON mage_generations(remote_id);")?;
     Ok(())
 }
 
