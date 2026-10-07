@@ -45,8 +45,15 @@ export function FolderPicker() {
     const roots = watchedFolders.filter((f) => !watchedFolders.some((o) => o !== f && f.startsWith(o + '/')))
     const exact = new Map<string, number>()
     for (const v of videos) exact.set(v.folder, (exact.get(v.folder) ?? 0) + 1)
+    // Folders with videos, plus every folder between them and their root
+    // (e.g. Mage/Videos for Mage/Videos/2026-10)
     const paths = new Set(roots)
-    for (const f of exact.keys()) if (roots.some((r) => f === r || f.startsWith(r + '/'))) paths.add(f)
+    for (const f of exact.keys()) {
+      const root = roots.find((r) => f === r || f.startsWith(r + '/'))
+      if (!root) continue
+      const parts = f.slice(root.length).split('/').filter(Boolean)
+      for (let i = 1; i <= parts.length; i++) paths.add(`${root}/${parts.slice(0, i).join('/')}`)
+    }
 
     const out: LibraryFolder[] = []
     for (const path of paths) {

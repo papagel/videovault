@@ -46,8 +46,13 @@ interface UIState {
   /** Fixed clips for the next Merge dialog (intro merges); cleared on close */
   mergePreset: MergePreset | null
   /** A one-click 8-second mix in progress (0–1), or its error */
-  quickMixStatus: { progress: number; error?: undefined } | { progress?: undefined; error: string } | null
-  setQuickMixStatus: (s: AppStore['quickMixStatus']) => void
+  /**
+   * A background merge shown in the toolbar (one-click mixes, intro merges):
+   * running (`progress` 0–1), or finished with a `message` or an `error`.
+   * `detail` is the tooltip.
+   */
+  taskStatus: { label: string; progress?: number; message?: string; error?: string; detail?: string } | null
+  setTaskStatus: (s: AppStore['taskStatus']) => void
   /** Videos waiting for a character to be picked for "Merge with intro" */
   introPickVideo: { videos: VideoFile[]; preferHandles: string[] } | null
   showTrimModal: boolean
@@ -261,8 +266,8 @@ export const useStore = create<AppStore>()(
       showMergeModal: false,
       mergePreset: null,
       introPickVideo: null,
-      quickMixStatus: null,
-      setQuickMixStatus: (quickMixStatus) => set({ quickMixStatus }),
+      taskStatus: null,
+      setTaskStatus: (taskStatus) => set({ taskStatus }),
       showTrimModal: false,
       showTagModal: false,
       showSettingsModal: false,

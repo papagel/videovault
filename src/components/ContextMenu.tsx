@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import { showPrompt } from '@/lib/dialog'
 import { useStore } from '@/store'
+import { startIntroMerges } from '@/lib/merge'
 import type { VideoFile, Collection } from '@/types'
 
 interface ContextMenuProps {
@@ -202,12 +203,12 @@ export function ContextMenu({ video, x, y, onClose }: ContextMenuProps) {
       <MenuItem
         icon={<Film size={13} />}
         label={isSelected && selectedCount > 1 ? `Merge ${selectedCount} videos with intro…` : 'Merge with intro…'}
-        title="Put a character's intro on top (8-second mix)"
+        title="Put each video's own character intro on top (7.7+0.3 mix)"
         onClick={() => {
           // Right-clicking one of several selected videos acts on all of them
           const s = useStore.getState()
           const targets = isSelected && selectedCount > 1 ? s.videos.filter((v) => s.selectedVideoIds.has(v.id)) : [video]
-          s.setIntroPickVideo({ videos: targets, preferHandles: [] })
+          startIntroMerges(targets)
           onClose()
         }}
       />

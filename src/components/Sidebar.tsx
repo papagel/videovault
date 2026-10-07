@@ -167,12 +167,27 @@ export function Sidebar() {
       exact.set(v.folder, (exact.get(v.folder) ?? 0) + 1)
     }
 
+    // Every folder between a root and a folder with videos is listed too
+    // (e.g. Mage/Videos for Mage/Videos/2026-10), so each row sits under its
+    // real parent. Sorted by path segment: "Videos/2026" stays right after
+    // "Videos", not after "Videos-old".
     const subs: Record<string, string[]> = {}
     for (const root of rootFolders) {
       const prefix = root + '/'
-      subs[root] = [...exact.keys()]
-        .filter((f) => f !== root && f.startsWith(prefix))
-        .sort()
+      const found = new Set<string>()
+      for (const f of exact.keys()) {
+        if (!f.startsWith(prefix)) continue
+        const parts = f.slice(prefix.length).split('/')
+        for (let i = 1; i <= parts.length; i++) found.add(prefix + parts.slice(0, i).join('/'))
+      }
+      subs[root] = [...found].sort((a, b) => {
+        const pa = a.split('/'), pb = b.split('/')
+        for (let i = 0; i < Math.min(pa.length, pb.length); i++) {
+          const c = pa[i].localeCompare(pb[i])
+          if (c !== 0) return c
+        }
+        return pa.length - pb.length
+      })
     }
     return { subfoldersByRoot: subs, exactFolderCounts: exact }
   }, [videos, rootFolders])

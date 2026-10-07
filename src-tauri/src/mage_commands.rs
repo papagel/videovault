@@ -2089,3 +2089,123 @@ pub fn backfill_input_copies(app: AppHandle) {
         }
     });
 }
+
+// ── Renamed results ─────────────────────────────────────────────────────────
+
+/// Point a generation at its renamed result file, and rename its
+/// References/<old name> folder to match. Returns whether any changed.
+pub fn sync_renamed_file(conn: &Connection, old: &str, new: &str) -> bool {
+    let rows: Vec<(String, String)> = conn
+        .prepare("SELECT id, inputs_json FROM mage_generations WHERE local_path = ?1")
+        .and_then(|mut st| st.query_map(params![old], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return false;
+    }
+    let stem = |p: &str| Path::new(p).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let (old_stem, new_stem) = (stem(old), stem(new));
+    for (id, inputs_json) in rows {
+        let mut inputs = inputs_json.clone();
+        // References/<old stem>/… → References/<new stem>/…
+        let marker = format!("/{}/{}/", SECTION_REFERENCES, old_stem);
+        if let Some(pos) = inputs.find(&marker) {
+            let start = inputs[..pos].rfind('"').map(|q| q + 1).unwrap_or(0);
+            let old_dir = format!("{}/{}/{}", &inputs[start..pos], SECTION_REFERENCES, old_stem);
+            let new_dir = format!("{}/{}/{}", &inputs[start..pos], SECTION_REFERENCES, new_stem);
+            if Path::new(&old_dir).is_dir() && !Path::new(&new_dir).exists() && std::fs::rename(&old_dir, &new_dir).is_ok() {
+                inputs = inputs.replace(&format!("{}/", old_dir), &format!("{}/", new_dir));
+            }
+        }
+        let _ = conn.execute(
+            "UPDATE mage_generations SET local_path = ?1, inputs_json = ?2 WHERE id = ?3",
+            params![new, inputs, id],
+        );
+    }
+    true
+}
+
+/// Relink generations whose result file was renamed (in VideoVault before
+/// renames updated them, or in Finder): through their library row, or by an
+/// identical file (same size and type) in the same folder. Library tags and
+/// collections stay with the video. Runs at startup.
+pub fn repair_renamed_results(app: &AppHandle) {
+    let gens: Vec<(String, String, Option<String>)> = with_conn(app, |conn| {
+        conn.prepare("SELECT id, local_path, video_id FROM mage_generations WHERE local_path IS NOT NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect()
+    })
+    .unwrap_or_default();
+    let missing: Vec<_> = gens.into_iter().filter(|(_, p, _)| !Path::new(p).exists()).collect();
+    if missing.is_empty() {
+        return;
+    }
+    let mut fixed = 0;
+    for (gen_id, old, video_id) in missing {
+        let result = with_conn(app, |conn| {
+            // 1. Renamed in VideoVault: its library row already has the new path
+            if let Some(vid) = &video_id {
+                let row: Option<String> = conn
+                    .query_row("SELECT path FROM videos WHERE id = ?1", params![vid], |r| r.get(0))
+                    .optional()?;
+                if let Some(p) = row.filter(|p| Path::new(p).exists()) {
+                    conn.execute("UPDATE videos SET is_deleted = 0 WHERE id = ?1", params![vid])?;
+                    return Ok(sync_renamed_file(conn, &old, &p));
+                }
+            }
+            // 2. Renamed in Finder: an identical file in the same folder
+            let Some(vid) = &video_id else { return Ok(false) };
+            let size: Option<i64> = conn
+                .query_row("SELECT size_bytes FROM videos WHERE id = ?1", params![vid], |r| r.get(0))
+                .optional()?;
+            let (Some(size), Some(dir)) = (size, Path::new(&old).parent()) else { return Ok(false) };
+            let ext = Path::new(&old).extension().map(|e| e.to_string_lossy().to_lowercase());
+            let used: std::collections::HashSet<String> = conn
+                .prepare("SELECT local_path FROM mage_generations WHERE local_path IS NOT NULL")?
+                .query_map([], |r| r.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            let candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+                .map(|it| {
+                    it.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_file())
+                        .filter(|p| p.extension().map(|e| e.to_string_lossy().to_lowercase()) == ext)
+                        .filter(|p| std::fs::metadata(p).map(|m| m.len() as i64 == size).unwrap_or(false))
+                        .filter(|p| !used.contains(&p.to_string_lossy().to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let [new] = candidates.as_slice() else { return Ok(false) };
+            let new = new.to_string_lossy().to_string();
+            let filename = Path::new(&new).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let other: Option<String> = conn
+                .query_row("SELECT id FROM videos WHERE path = ?1 AND id != ?2", params![new, vid], |r| r.get(0))
+                .optional()?;
+            match other {
+                // The watcher indexed the new name as a new video: move tags and
+                // collections onto it and retire the old row
+                Some(other) => {
+                    conn.execute("INSERT OR IGNORE INTO video_tags (video_id, tag_id) SELECT ?1, tag_id FROM video_tags WHERE video_id = ?2", params![other, vid])?;
+                    conn.execute("INSERT OR IGNORE INTO collection_videos (collection_id, video_id, position) SELECT collection_id, ?1, position FROM collection_videos WHERE video_id = ?2", params![other, vid])?;
+                    conn.execute("UPDATE videos SET is_deleted = 1 WHERE id = ?1", params![vid])?;
+                    conn.execute("UPDATE videos SET is_deleted = 0 WHERE id = ?1", params![other])?;
+                    conn.execute("UPDATE mage_generations SET video_id = ?1 WHERE id = ?2", params![other, gen_id])?;
+                }
+                // Otherwise the same row simply gets the new name
+                None => {
+                    conn.execute(
+                        "UPDATE videos SET path = ?1, filename = ?2, is_deleted = 0 WHERE id = ?3",
+                        params![new, filename, vid],
+                    )?;
+                }
+            }
+            Ok(sync_renamed_file(conn, &old, &new))
+        });
+        if matches!(result, Ok(true)) {
+            fixed += 1;
+        }
+    }
+    if fixed > 0 {
+        log::info!("Relinked {} renamed generation result(s)", fixed);
+    }
+}

@@ -3,10 +3,10 @@ import { useShallow } from 'zustand/react/shallow'
 import {
   Grid3X3, List, Merge,
   Scissors, Tag, Trash2, SortAsc, SortDesc, ChevronDown,
-  PanelLeftClose, PanelLeft, Library, Sparkles, Gem, Loader2, Timer, Film,
+  PanelLeftClose, PanelLeft, Library, Sparkles, Gem, Loader2, Timer, Film, X,
 } from 'lucide-react'
 import { FolderPicker } from './FolderPicker'
-import { MIX_SPLITS, mixProblem, quickMix, splitLabel } from '@/lib/merge'
+import { MIX_SPLITS, finishTask, mixProblem, quickMix, splitLabel, startIntroMerges } from '@/lib/merge'
 import { useStore } from '@/store'
 import { cn } from '@/lib/utils'
 import type { SortField } from '@/types'
@@ -120,7 +120,7 @@ export function Toolbar() {
       <div className="flex-1" />
 
       {/* Selection actions */}
-      <QuickMixStatus />
+      <TaskStatus />
 
       {selectedCount > 0 && (
         <div className="flex items-center gap-1 bg-[#1e1e2a] border border-[#2a2a3a] rounded-lg px-2 py-1">
@@ -138,7 +138,7 @@ export function Toolbar() {
           <ToolbarActionButton
             onClick={() => {
               const st = useStore.getState()
-              st.setIntroPickVideo({ videos: st.videos.filter((v) => st.selectedVideoIds.has(v.id)), preferHandles: [] })
+              startIntroMerges(st.videos.filter((v) => st.selectedVideoIds.has(v.id)))
             }}
             title={selectedCount > 1 ? `Merge ${selectedCount} videos with an intro` : 'Merge with intro'}
             icon={<Film size={13} />}
@@ -231,26 +231,24 @@ function ToolbarActionButton({
  */
 function QuickMix() {
   const selected = useStore(useShallow((s) => s.videos.filter((v) => s.selectedVideoIds.has(v.id))))
-  const busy = useStore((s) => s.quickMixStatus?.progress != null)
+  const busy = useStore((s) => s.taskStatus?.progress != null)
   if (selected.length !== 2) return null
   const [a, b] = selected
 
   const run = async (splitIdx: number, keepStart: boolean) => {
     const s = useStore.getState()
-    s.setQuickMixStatus({ progress: 0 })
+    const label = `8s mix ${splitLabel(MIX_SPLITS[splitIdx])}`
+    s.setTaskStatus({ label, progress: 0 })
     // Unselect right away; the two videos are already captured above
     s.clearSelection()
     try {
       const video = await quickMix(a, b, MIX_SPLITS[splitIdx], keepStart ? 'start' : 'end', (progress) =>
-        useStore.getState().setQuickMixStatus({ progress })
+        useStore.getState().setTaskStatus({ label, progress })
       )
-      useStore.getState().setQuickMixStatus(null)
+      useStore.getState().setTaskStatus(null)
       useStore.getState().playVideo(video, [video], { selectOnClose: false })
     } catch (e) {
-      useStore.getState().setQuickMixStatus({ error: String(e) })
-      setTimeout(() => {
-        if (useStore.getState().quickMixStatus?.error) useStore.getState().setQuickMixStatus(null)
-      }, 8000)
+      finishTask({ label, error: String(e) })
     }
   }
 
@@ -275,20 +273,30 @@ function QuickMix() {
   )
 }
 
-/** Progress or failure of a one-click mix (shown even after the selection clears) */
-function QuickMixStatus() {
-  const status = useStore((s) => s.quickMixStatus)
+/** Progress, result or failure of a background merge (stays after the selection clears) */
+function TaskStatus() {
+  const status = useStore((s) => s.taskStatus)
   if (!status) return null
   if (status.error) {
     return (
-      <span className="text-[11px] text-red-400 max-w-[220px] truncate" title={status.error}>
-        8s mix failed: {status.error}
+      <span className="text-[11px] text-red-400 max-w-[260px] truncate" title={status.detail ?? status.error}>
+        {status.label} failed: {status.error}
+      </span>
+    )
+  }
+  if (status.message) {
+    return (
+      <span className="flex items-center gap-1.5 text-[11px] text-[#8888aa] max-w-[320px]" title={status.detail}>
+        <span className="truncate">{status.label}: {status.message}</span>
+        <button onClick={() => useStore.getState().setTaskStatus(null)} className="text-[#55556a] hover:text-white flex-shrink-0">
+          <X size={11} />
+        </button>
       </span>
     )
   }
   return (
-    <span className="flex items-center gap-1.5 text-[11px] text-[#8888aa] tabular-nums">
-      <Loader2 size={12} className="animate-spin text-[#6366f1]" /> 8s mix {Math.round((status.progress ?? 0) * 100)}%
+    <span className="flex items-center gap-1.5 text-[11px] text-[#8888aa] tabular-nums" title={status.detail}>
+      <Loader2 size={12} className="animate-spin text-[#6366f1]" /> {status.label} {Math.round((status.progress ?? 0) * 100)}%
     </span>
   )
 }

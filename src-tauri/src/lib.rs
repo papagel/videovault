@@ -81,6 +81,8 @@ pub fn run() {
 
             // Older flat Mage folders are sorted into sections once
             mage_commands::reorganize_mage_folder(app.handle());
+            // Generations whose result was renamed find it again
+            mage_commands::repair_renamed_results(app.handle());
 
             // Resume Mage generations that were in flight when the app quit
             mage_commands::resume_pending(app.handle().clone());

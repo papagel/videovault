@@ -8,8 +8,9 @@ import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '@/store'
 import { showConfirm } from '@/lib/dialog'
 import { cn, getThumbnailSrc, getVideoSrc } from '@/lib/utils'
-import { FINAL_STATUSES, isRetryable, mentionedHandles, remixGeneration, shortTime, statusLabel } from '@/lib/mage'
+import { FINAL_STATUSES, isRetryable, remixGeneration, shortTime, statusLabel } from '@/lib/mage'
 import { videoForGeneration } from '@/lib/intro'
+import { startIntroMerges } from '@/lib/merge'
 import { DRAG_MIME } from './StudioPanel'
 import { ImportPanel } from './ImportPanel'
 import type { MageGeneration, MageThumbSize } from '@/types'
@@ -225,7 +226,7 @@ function GenerationCard({
   const makeCharacter = act(async () => setEntityModal({ type: 'character', filePath: g.local_path! }))
   const mergeWithIntro = act(async () => {
     const video = await videoForGeneration(g)
-    if (video) useStore.getState().setIntroPickVideo({ videos: [video], preferHandles: mentionedHandles(g.prompt) })
+    if (video) startIntroMerges([video])
   })
 
   return (

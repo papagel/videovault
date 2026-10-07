@@ -1,7 +1,9 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useStore } from '@/store'
-import type { VideoFile } from '@/types'
+import { ensureEntities, openIntroMerge } from '@/lib/intro'
+import { mentionedHandles } from '@/lib/mage'
+import type { MageEntity, MageGeneration, VideoFile } from '@/types'
 
 /** 8-second mix: seconds taken from the longer and the shorter video */
 export const MIX_TOTAL = 8
@@ -118,4 +120,107 @@ export async function quickMix(
   } finally {
     unlisten()
   }
+}
+
+// ── Automatic intro merges ──────────────────────────────────────────────────
+
+/** Show a finished background task in the toolbar for a while. */
+export function finishTask(status: { label: string; message?: string; error?: string; detail?: string }) {
+  const s = useStore.getState()
+  s.setTaskStatus(status)
+  setTimeout(() => {
+    if (useStore.getState().taskStatus === status) useStore.getState().setTaskStatus(null)
+  }, 15000)
+}
+
+/** Generations, loading them if the Create view hasn't yet. */
+async function ensureGenerations(): Promise<MageGeneration[]> {
+  const s = useStore.getState()
+  if (s.mageGenerations.length > 0) return s.mageGenerations
+  const list = await invoke<MageGeneration[]>('mage_list_generations')
+  s.setMageGenerations(list)
+  return list
+}
+
+/**
+ * The intro for a video: the first of its @references, in the order of the
+ * prompt it was generated with and then its @ tags, that has an intro.
+ */
+export function introFor(video: VideoFile, entities: MageEntity[], generations: MageGeneration[]): MageEntity | null {
+  const g = generations.find((x) => x.video_id === video.id || (x.local_path && x.local_path === video.path))
+  const handles = [
+    ...(g ? mentionedHandles(g.prompt) : []),
+    ...video.tags.filter((t) => t.name.startsWith('@')).map((t) => t.name.slice(1).toLowerCase()),
+  ]
+  for (const h of handles) {
+    const e = entities.find((x) => x.handle.toLowerCase() === h && x.intro)
+    if (e) return e
+  }
+  return null
+}
+
+/**
+ * "Merge with intro" on a selection. One video: the Merge dialog opens with
+ * its own intro (the picker only when none is found). Several: each is
+ * merged with its own intro as a 7.7+0.3 mix and saved, no dialog; videos
+ * without one are skipped and listed in the summary.
+ */
+export async function startIntroMerges(videos: VideoFile[]) {
+  if (videos.length === 0) return
+  const [entities, generations] = await Promise.all([
+    ensureEntities().catch(() => [] as MageEntity[]),
+    ensureGenerations().catch(() => [] as MageGeneration[]),
+  ])
+  if (videos.length === 1) {
+    const intro = introFor(videos[0], entities, generations)
+    if (intro) openIntroMerge(videos[0], intro)
+    else useStore.getState().setIntroPickVideo({ videos, preferHandles: [] })
+    return
+  }
+
+  const label = 'Intro merges'
+  const split = MIX_SPLITS[INTRO_SPLIT_INDEX]
+  const s = useStore.getState()
+  s.clearSelection()
+  const saved: string[] = []
+  const skipped: string[] = []
+  const failed: string[] = []
+  for (let i = 0; i < videos.length; i++) {
+    const video = videos[i]
+    const entity = introFor(video, entities, generations)
+    const problem = !entity?.intro
+      ? 'no character with an intro'
+      : introMixProblem(video, entity.intro.duration_secs, split)
+    if (problem || !entity?.intro) {
+      skipped.push(`${video.filename}: ${problem}`)
+      continue
+    }
+    const step = (progress: number) =>
+      useStore.getState().setTaskStatus({
+        label: `${label} ${i + 1}/${videos.length}`,
+        progress,
+        detail: `${video.filename} with @${entity.handle}'s intro`,
+      })
+    step(0)
+    try {
+      const merged = await introMix(
+        video,
+        { id: `intro:${entity.id}`, path: entity.intro.path, duration_secs: entity.intro.duration_secs },
+        split,
+        'end',
+        step,
+      )
+      saved.push(`${video.filename} + @${entity.handle} → ${merged.filename}`)
+    } catch (e) {
+      failed.push(`${video.filename}: ${e}`)
+    }
+  }
+  const parts = [`${saved.length} saved`]
+  if (skipped.length) parts.push(`${skipped.length} skipped`)
+  if (failed.length) parts.push(`${failed.length} failed`)
+  finishTask({
+    label,
+    message: parts.join(', '),
+    detail: [...saved, ...skipped.map((x) => `Skipped ${x}`), ...failed.map((x) => `Failed ${x}`)].join('\n'),
+  })
 }

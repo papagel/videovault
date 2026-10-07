@@ -827,6 +827,7 @@ pub async fn rename_video(
     video_id: String,
     new_name: String,
     db: State<'_, DbState>,
+    app: tauri::AppHandle,
 ) -> Result<String, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
 
@@ -859,6 +860,11 @@ pub async fn rename_video(
     )
     .map_err(|e| e.to_string())?;
 
+    // A generated video: its Create entry follows the new name
+    if crate::mage_commands::sync_renamed_file(&conn, &path, &new_path) {
+        let _ = app.emit("mage-generations-changed", ());
+    }
+
     Ok(new_path)
 }
 
@@ -886,6 +892,7 @@ pub async fn batch_rename_videos(
     video_ids: Vec<String>,
     base_name: String,
     db: State<'_, DbState>,
+    app: tauri::AppHandle,
 ) -> Result<Vec<BatchRenameResult>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let total = video_ids.len();
@@ -988,6 +995,7 @@ pub async fn batch_rename_videos(
     // remaining files at temp names, but their DB rows point at those temp paths,
     // so the library stays consistent and playable.
     let mut results = Vec::with_capacity(total);
+    let mut mage_renamed = false;
     for op in &ops {
         std::fs::rename(&op.temp_path, &op.new_path)
             .map_err(|e| format!("Failed to finalize rename to {}: {}", op.new_path, e))?;
@@ -998,6 +1006,10 @@ pub async fn batch_rename_videos(
         )
         .map_err(|e| e.to_string())?;
 
+        if crate::mage_commands::sync_renamed_file(&conn, &op.old_path, &op.new_path) {
+            mage_renamed = true;
+        }
+
         results.push(BatchRenameResult {
             video_id: op.video_id.clone(),
             new_path: op.new_path.clone(),
@@ -1005,6 +1017,9 @@ pub async fn batch_rename_videos(
         });
     }
 
+    if mage_renamed {
+        let _ = app.emit("mage-generations-changed", ());
+    }
     Ok(results)
 }
 

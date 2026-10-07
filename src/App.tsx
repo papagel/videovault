@@ -86,6 +86,7 @@ const AppWrapper = () => {
     let unlistenMage: (() => void) | undefined
     let unlistenTags: (() => void) | undefined
     let unlistenFolders: (() => void) | undefined
+    let unlistenMageRenamed: (() => void) | undefined
 
     const t = setTimeout(async () => {
       try {
@@ -130,6 +131,13 @@ const AppWrapper = () => {
           invoke<Tag[]>('get_all_tags').then((t) => useStore.getState().setTags(t)).catch(console.warn)
         })
 
+        // A renamed generated video: reload the Create gallery's paths
+        unlistenMageRenamed = await listen('mage-generations-changed', () => {
+          invoke<MageGeneration[]>('mage_list_generations')
+            .then((g) => useStore.getState().setMageGenerations(g))
+            .catch(console.warn)
+        })
+
         // The Mage folder joins the library on the first download
         unlistenFolders = await listen('watched-folders-changed', () => {
           invoke<string[]>('get_watched_folders')
@@ -150,6 +158,7 @@ const AppWrapper = () => {
       unlistenMage?.()
       unlistenTags?.()
       unlistenFolders?.()
+      unlistenMageRenamed?.()
     }
   }, [])
 
