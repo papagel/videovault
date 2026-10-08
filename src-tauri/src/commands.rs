@@ -534,6 +534,35 @@ pub async fn scan_folder_background(
             .cloned()
             .collect();
 
+        // Renamed or moved while the app wasn't watching: pair them with new
+        // files first, so they keep their entries
+        let new_candidates: Vec<String> = disk_files
+            .iter()
+            .filter(|(p, _)| !known_paths.contains(p))
+            .map(|(p, _)| p.clone())
+            .collect();
+        let renamed: Vec<RenamedVideo> = if missing.is_empty() || new_candidates.is_empty() {
+            vec![]
+        } else {
+            let db = app.state::<DbState>();
+            let result = db.0.lock().ok().map(|conn| reconcile_renames(&conn, &missing, &new_candidates));
+            match result {
+                Some((list, mage_changed)) => {
+                    if mage_changed {
+                        let _ = app.emit("mage-generations-changed", ());
+                    }
+                    list
+                }
+                None => vec![],
+            }
+        };
+        for r in &renamed {
+            let _ = app.emit("video-renamed", r);
+        }
+        let renamed_old: std::collections::HashSet<String> = renamed.iter().map(|r| r.old_path.clone()).collect();
+        let renamed_new: std::collections::HashSet<String> = renamed.iter().map(|r| r.path.clone()).collect();
+        let missing: Vec<String> = missing.into_iter().filter(|p| !renamed_old.contains(p)).collect();
+
         if !missing.is_empty() {
             {
                 let db = app.state::<DbState>();
@@ -555,7 +584,7 @@ pub async fn scan_folder_background(
         let excluded = crate::mage_commands::library_exclusion(&app);
         let new_files: Vec<(String, String)> = disk_files
             .into_iter()
-            .filter(|(p, _)| !known_paths.contains(p))
+            .filter(|(p, _)| !known_paths.contains(p) && !renamed_new.contains(p))
             .filter(|(p, _)| !excluded.as_ref().is_some_and(|dir| p.starts_with(dir.as_str())))
             .collect();
 
@@ -647,44 +676,275 @@ pub async fn scan_folder_background(
 pub async fn handle_fs_event(app: tauri::AppHandle, event: notify::Event) {
     use notify::EventKind;
 
-    match event.kind {
-        EventKind::Create(_) => {
-            for path in event.paths {
-                if !is_video_file(&path) {
-                    continue;
-                }
-                let path_str = path.to_string_lossy().to_string();
-                if crate::mage_commands::library_exclusion(&app).is_some_and(|dir| path_str.starts_with(&dir)) {
-                    continue;
-                }
-                // Brief pause so the OS finishes writing the file before we probe it
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-                let thumb_dir = app.state::<ThumbDirState>().0.clone();
-                let db = app.state::<DbState>();
-                if let Some(video) = tokio::task::block_in_place(|| {
-                    index_single_video(&*db, &path_str, &thumb_dir)
-                }) {
-                    let _ = app.emit("video-found", video);
-                }
-            }
-        }
-        EventKind::Remove(_) => {
-            for path in event.paths {
-                let path_str = path.to_string_lossy().to_string();
-                let db = app.state::<DbState>();
-                {
-                    let conn = db.0.lock().unwrap();
-                    let _ = conn.execute(
-                        "UPDATE videos SET is_deleted = 1 WHERE path = ?1",
-                        params![path_str],
-                    );
-                }
-                let _ = app.emit("video-removed", VideoRemoved { path: path_str });
-            }
-        }
-        _ => {}
+    // Adds, removals and renames (Finder renames arrive as name changes, or as
+    // a remove plus a create) are gathered per folder and settled together a
+    // moment later, so a rename keeps its library entry instead of becoming a
+    // removed video plus a new one.
+    if !matches!(event.kind, EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))) {
+        return;
     }
+    let mut dirs = Vec::new();
+    for path in &event.paths {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with('.') {
+            continue;
+        }
+        // A file's folder; for a folder (renamed or moved), its parent, so its
+        // whole contents are compared
+        if let Some(parent) = path.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    if !dirs.is_empty() {
+        schedule_reconcile(app, dirs);
+    }
+}
+
+/// Folders with pending changes, and whether a settle pass is scheduled.
+fn pending_dirs() -> &'static std::sync::Mutex<(std::collections::HashSet<std::path::PathBuf>, bool)> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<(std::collections::HashSet<std::path::PathBuf>, bool)>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+
+/// Settle changed folders ~2s after the last change (also lets copies finish
+/// writing before they're probed).
+fn schedule_reconcile(app: tauri::AppHandle, dirs: Vec<std::path::PathBuf>) {
+    let mut guard = pending_dirs().lock().unwrap();
+    guard.0.extend(dirs);
+    if guard.1 {
+        return;
+    }
+    guard.1 = true;
+    drop(guard);
+    tauri::async_runtime::spawn(async move {
+        // Wait until no new changes arrived for 2 seconds
+        let mut last = pending_dirs().lock().unwrap().0.len();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let now = pending_dirs().lock().unwrap().0.len();
+            if now == last {
+                break;
+            }
+            last = now;
+        }
+        let dirs: Vec<std::path::PathBuf> = {
+            let mut guard = pending_dirs().lock().unwrap();
+            guard.1 = false;
+            guard.0.drain().collect()
+        };
+        tokio::task::block_in_place(|| reconcile_dirs(&app, dirs));
+    });
+}
+
+/// Bring the library in line with what's on disk in these folders (and their
+/// subfolders): renamed or moved videos keep their entries, new videos are
+/// added, missing ones are removed.
+fn reconcile_dirs(app: &tauri::AppHandle, mut dirs: Vec<std::path::PathBuf>) {
+    // An ancestor's pass covers its subfolders
+    dirs.sort();
+    dirs.dedup();
+    let dirs: Vec<std::path::PathBuf> = dirs
+        .iter()
+        .filter(|d| !dirs.iter().any(|o| o != *d && d.starts_with(o)))
+        .cloned()
+        .collect();
+
+    let excluded = crate::mage_commands::library_exclusion(app);
+    let db = app.state::<DbState>();
+    let (missing, new_files) = {
+        let Ok(conn) = db.0.lock() else { return };
+        let mut missing = Vec::new();
+        let mut known = std::collections::HashSet::new();
+        for dir in &dirs {
+            let d = dir.to_string_lossy().to_string();
+            let rows: Vec<String> = conn
+                .prepare("SELECT path FROM videos WHERE is_deleted = 0 AND (folder = ?1 OR folder LIKE ?2)")
+                .and_then(|mut st| st.query_map(params![d, format!("{}/%", d)], |r| r.get(0))?.collect())
+                .unwrap_or_default();
+            for p in rows {
+                if !Path::new(&p).exists() {
+                    missing.push(p.clone());
+                }
+                known.insert(p);
+            }
+        }
+        let mut new_files = Vec::new();
+        for dir in &dirs {
+            for entry in WalkDir::new(dir).into_iter().filter_entry(|e| {
+                e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.')
+            }).flatten() {
+                if !entry.file_type().is_file() || !is_video_file(entry.path()) {
+                    continue;
+                }
+                let p = entry.path().to_string_lossy().to_string();
+                if known.contains(&p) || excluded.as_ref().is_some_and(|x| p.starts_with(x.as_str())) {
+                    continue;
+                }
+                // Not yet known here: maybe known under another folder's row
+                let live: bool = conn
+                    .query_row("SELECT 1 FROM videos WHERE path = ?1 AND is_deleted = 0", params![p], |_| Ok(true))
+                    .unwrap_or(false);
+                if !live {
+                    new_files.push(p);
+                }
+            }
+        }
+        (missing, new_files)
+    };
+    if missing.is_empty() && new_files.is_empty() {
+        return;
+    }
+
+    // Renames and moves first, so they keep their entries
+    let (matches, mage_changed) = {
+        let Ok(conn) = db.0.lock() else { return };
+        reconcile_renames(&conn, &missing, &new_files)
+    };
+    for m in &matches {
+        let _ = app.emit("video-renamed", m);
+    }
+    if mage_changed {
+        let _ = app.emit("mage-generations-changed", ());
+    }
+
+    let matched_old: std::collections::HashSet<&str> = matches.iter().map(|m| m.old_path.as_str()).collect();
+    let matched_new: std::collections::HashSet<&str> = matches.iter().map(|m| m.path.as_str()).collect();
+    let thumb_dir = app.state::<ThumbDirState>().0.clone();
+    for p in new_files.iter().filter(|p| !matched_new.contains(p.as_str())) {
+        if let Some(video) = index_single_video(&*db, p, &thumb_dir) {
+            let _ = app.emit("video-found", video);
+        }
+    }
+    let mut removed_any = false;
+    for p in missing.iter().filter(|p| !matched_old.contains(p.as_str())) {
+        if let Ok(conn) = db.0.lock() {
+            let _ = conn.execute("UPDATE videos SET is_deleted = 1 WHERE path = ?1", params![p]);
+        }
+        let _ = app.emit("video-removed", VideoRemoved { path: p.clone() });
+        removed_any = true;
+    }
+    // A generated video deleted outside the app leaves the Create gallery too
+    if removed_any && crate::mage_commands::prune_removed_results(app) > 0 {
+        let _ = app.emit("mage-generations-changed", ());
+    }
+}
+
+/// Undo splits made before renames were recognized: a deleted entry whose
+/// file is gone, with tags, collections or plays, and exactly one identical
+/// file (same size and type, in the same folder or with the same name) that
+/// came back as a separate entry. Its tags, collections and plays move onto
+/// that entry and the old one is dropped. Returns how many were joined.
+pub fn rejoin_split_renames(conn: &Connection) -> usize {
+    let dead: Vec<(String, String, i64, i64, Option<String>)> = conn
+        .prepare(
+            "SELECT id, path, size_bytes, play_count, last_played_at FROM videos v WHERE is_deleted = 1 AND (
+               play_count > 0
+               OR EXISTS (SELECT 1 FROM video_tags t WHERE t.video_id = v.id)
+               OR EXISTS (SELECT 1 FROM collection_videos c WHERE c.video_id = v.id))",
+        )
+        .and_then(|mut st| st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect())
+        .unwrap_or_default();
+    let ext = |p: &str| Path::new(p).extension().map(|e| e.to_string_lossy().to_lowercase());
+    let mut joined = 0;
+    for (id, path, size, plays, last) in dead {
+        if Path::new(&path).exists() {
+            continue; // restorable as it is
+        }
+        let twins: Vec<(String, String)> = conn
+            .prepare("SELECT id, path FROM videos WHERE is_deleted = 0 AND size_bytes = ?1")
+            .and_then(|mut st| st.query_map(params![size], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+            .unwrap_or_default();
+        let twins: Vec<_> = twins
+            .into_iter()
+            .filter(|(_, p)| Path::new(p).exists() && ext(p) == ext(&path))
+            .filter(|(_, p)| {
+                Path::new(p).parent() == Path::new(&path).parent() || Path::new(p).file_name() == Path::new(&path).file_name()
+            })
+            .collect();
+        let [(twin, twin_path)] = twins.as_slice() else { continue };
+        let ok = conn.execute_batch("SAVEPOINT rejoin").is_ok()
+            && conn.execute("INSERT OR IGNORE INTO video_tags (video_id, tag_id) SELECT ?1, tag_id FROM video_tags WHERE video_id = ?2", params![twin, id]).is_ok()
+            && conn.execute("INSERT OR IGNORE INTO collection_videos (collection_id, video_id, position) SELECT collection_id, ?1, position FROM collection_videos WHERE video_id = ?2", params![twin, id]).is_ok()
+            && conn.execute(
+                "UPDATE videos SET play_count = play_count + ?1, last_played_at = COALESCE(MAX(last_played_at, ?2), last_played_at, ?2) WHERE id = ?3",
+                params![plays, last, twin],
+            ).is_ok()
+            && conn.execute("UPDATE mage_generations SET video_id = ?1 WHERE video_id = ?2", params![twin, id]).is_ok()
+            && conn.execute("DELETE FROM video_tags WHERE video_id = ?1", params![id]).is_ok()
+            && conn.execute("DELETE FROM collection_videos WHERE video_id = ?1", params![id]).is_ok()
+            && conn.execute("DELETE FROM videos WHERE id = ?1", params![id]).is_ok();
+        if ok {
+            let _ = conn.execute_batch("RELEASE rejoin");
+            let _ = crate::mage_commands::sync_renamed_file(conn, &path, twin_path);
+            joined += 1;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK TO rejoin; RELEASE rejoin");
+        }
+    }
+    joined
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct RenamedVideo {
+    pub video_id: String,
+    pub old_path: String,
+    pub path: String,
+    pub filename: String,
+    pub folder: String,
+}
+
+/// Pair library videos whose file is gone with new files that are clearly the
+/// same video (same size and type): in the same folder (a rename), else with
+/// the same name (moved, or its folder renamed), else the only such file.
+/// Ambiguous ones are left alone. Matched rows take the new path, keeping
+/// tags, collections and play counts; generated videos keep their Create entry.
+pub fn reconcile_renames(conn: &Connection, missing: &[String], new_files: &[String]) -> (Vec<RenamedVideo>, bool) {
+    let ext = |p: &str| Path::new(p).extension().map(|e| e.to_string_lossy().to_lowercase());
+    let size_of = |p: &str| std::fs::metadata(p).map(|m| m.len() as i64).ok();
+    let mut free: Vec<(String, Option<i64>)> = new_files.iter().map(|p| (p.clone(), size_of(p))).collect();
+    let mut out = Vec::new();
+    let mut mage_changed = false;
+    for old in missing {
+        let Ok((id, size)) = conn.query_row(
+            "SELECT id, size_bytes FROM videos WHERE path = ?1 AND is_deleted = 0",
+            params![old],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        ) else {
+            continue;
+        };
+        let same: Vec<usize> = free
+            .iter()
+            .enumerate()
+            .filter(|(_, (p, s))| *s == Some(size) && ext(p) == ext(old))
+            .map(|(i, _)| i)
+            .collect();
+        let old_parent = Path::new(old).parent();
+        let old_name = Path::new(old).file_name();
+        let in_folder: Vec<usize> = same.iter().copied().filter(|&i| Path::new(&free[i].0).parent() == old_parent).collect();
+        let same_name: Vec<usize> = same.iter().copied().filter(|&i| Path::new(&free[i].0).file_name() == old_name).collect();
+        let pick = match (in_folder.as_slice(), same_name.as_slice(), same.as_slice()) {
+            ([i], _, _) => Some(*i),
+            ([], [i], _) => Some(*i),
+            ([], [], [i]) => Some(*i),
+            _ => None,
+        };
+        let Some(i) = pick else { continue };
+        let (new, _) = free.remove(i);
+        let filename = Path::new(&new).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let folder = Path::new(&new).parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+        // A stale soft-deleted row could hold the new path
+        let _ = conn.execute("DELETE FROM videos WHERE path = ?1 AND is_deleted = 1", params![new]);
+        if conn
+            .execute("UPDATE videos SET path = ?1, filename = ?2, folder = ?3 WHERE id = ?4", params![new, filename, folder, id])
+            .is_err()
+        {
+            continue;
+        }
+        mage_changed |= crate::mage_commands::sync_renamed_file(conn, old, &new);
+        out.push(RenamedVideo { video_id: id, old_path: old.clone(), path: new, filename, folder });
+    }
+    (out, mage_changed)
 }
 
 #[tauri::command]
@@ -1909,4 +2169,257 @@ pub async fn open_url_in(url: String, browser: Option<String>) -> Result<(), Str
         .status()
         .map_err(|e| e.to_string())
         .and_then(|s| if s.success() { Ok(()) } else { Err(format!("Could not open {}", url)) })
+}
+
+#[derive(Debug, Serialize)]
+pub struct MovedVideo {
+    pub video_id: String,
+    pub path: String,
+    pub filename: String,
+    pub folder: String,
+}
+
+/// Move videos into another folder (a name already there gets " (2)").
+/// The row is updated before the file moves, so the folder watcher never
+/// sees a library video "disappear": tags, collections and play counts stay,
+/// and generated videos keep their Create entry and References folder.
+#[tauri::command]
+pub async fn move_videos(
+    video_ids: Vec<String>,
+    dest_folder: String,
+    db: State<'_, DbState>,
+    app: tauri::AppHandle,
+) -> Result<Vec<MovedVideo>, String> {
+    let dest = Path::new(&dest_folder);
+    if !dest.is_dir() {
+        return Err(format!("{} is not a folder", dest_folder));
+    }
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut moved = Vec::new();
+    let mut errors = Vec::new();
+    let mut mage_changed = false;
+    for id in &video_ids {
+        match move_video_file(&conn, id, dest) {
+            Ok(Some((m, mage))) => {
+                mage_changed |= mage;
+                moved.push(m);
+            }
+            Ok(None) => {}
+            Err(e) => errors.push(e),
+        }
+    }
+    drop(conn);
+    if mage_changed {
+        let _ = app.emit("mage-generations-changed", ());
+    }
+    if moved.is_empty() && !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    Ok(moved)
+}
+
+/// Move one library video into `dest`: row first, then the file (back on
+/// failure). None when it's already there or unknown; the flag says whether
+/// a Create entry followed it.
+fn move_video_file(conn: &Connection, id: &str, dest: &Path) -> Result<Option<(MovedVideo, bool)>, String> {
+    let Ok(old) = conn.query_row("SELECT path FROM videos WHERE id = ?1", params![id], |r| r.get::<_, String>(0)) else {
+        return Ok(None);
+    };
+    let old_path = Path::new(&old);
+    if old_path.parent() == Some(dest) {
+        return Ok(None);
+    }
+    let Some(name) = old_path.file_name() else { return Ok(None) };
+    let new_path = crate::mage_commands::free_path(dest.join(name));
+    let new = new_path.to_string_lossy().to_string();
+    let filename = new_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let dest_folder = dest.to_string_lossy().to_string();
+    let old_name = old_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let old_folder = old_path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let update = |path: &str, file: &str, folder: &str| {
+        conn.execute(
+            "UPDATE videos SET path = ?1, filename = ?2, folder = ?3 WHERE id = ?4",
+            params![path, file, folder, id],
+        )
+    };
+    // Clear a stale soft-deleted row that holds the target path
+    let _ = conn.execute("DELETE FROM videos WHERE path = ?1 AND is_deleted = 1", params![new]);
+    update(&new, &filename, &dest_folder).map_err(|e| format!("{}: {}", old_name, e))?;
+    // Same disk: a rename. Another disk: copy, then remove the original.
+    let result = std::fs::rename(&old, &new).or_else(|_| std::fs::copy(&old, &new).and_then(|_| std::fs::remove_file(&old)));
+    if let Err(e) = result {
+        // The original is still there: drop any partial copy, put the row back
+        if Path::new(&old).exists() {
+            let _ = std::fs::remove_file(&new);
+        }
+        let _ = update(&old, &old_name, &old_folder);
+        return Err(format!("{}: {}", old_name, e));
+    }
+    let mage = crate::mage_commands::sync_renamed_file(conn, &old, &new);
+    Ok(Some((MovedVideo { video_id: id.to_string(), path: new, filename, folder: dest_folder }, mage)))
+}
+
+/// Make a new folder inside a library folder; returns its path.
+#[tauri::command]
+pub async fn create_folder(parent: String, name: String) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() || name.starts_with('.') || name.contains('/') || name.contains(':') {
+        return Err("Use a name without / or : that doesn't start with a dot".into());
+    }
+    if !Path::new(&parent).is_dir() {
+        return Err(format!("{} is not a folder", parent));
+    }
+    let path = Path::new(&parent).join(name);
+    if path.exists() {
+        return Err(format!("{} already exists", name));
+    }
+    std::fs::create_dir(&path).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Empty folders inside the given library folders (hidden ones skipped), so
+/// a new folder shows in the sidebar before anything is moved into it.
+#[tauri::command]
+pub async fn list_empty_folders(roots: Vec<String>) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for root in roots {
+        let walker = WalkDir::new(&root).min_depth(1).follow_links(false).into_iter().filter_entry(|e| {
+            !e.file_name().to_string_lossy().starts_with('.')
+        });
+        for entry in walker.flatten() {
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            let empty = std::fs::read_dir(entry.path())
+                .map(|mut it| it.all(|e| e.map(|e| e.file_name() == ".DS_Store").unwrap_or(true)))
+                .unwrap_or(false);
+            if empty {
+                out.push(entry.path().to_string_lossy().to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod move_tests {
+    use super::move_video_file;
+    use rusqlite::params;
+
+    #[test]
+    fn moves_files_and_rows_together() {
+        let dir = std::env::temp_dir().join(format!("vv-move-{}", uuid::Uuid::new_v4()));
+        let (a, b) = (dir.join("A"), dir.join("B"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let conn = crate::db::init_db(&dir.join("t.db").to_string_lossy()).unwrap();
+        let add = |id: &str, folder: &std::path::Path, name: &str, bytes: &[u8]| {
+            let p = folder.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            conn.execute(
+                "INSERT INTO videos (id, path, filename, folder, size_bytes, indexed_at) VALUES (?1, ?2, ?3, ?4, 1, 'now')",
+                params![id, p.to_string_lossy(), name, folder.to_string_lossy()],
+            ).unwrap();
+        };
+        add("v1", &a, "clip.mp4", b"one");
+        add("v2", &a, "same.mp4", b"two");
+        std::fs::write(b.join("same.mp4"), b"already in B").unwrap();
+
+        // Plain move
+        let (m, _) = move_video_file(&conn, "v1", &b).unwrap().unwrap();
+        assert_eq!(m.path, b.join("clip.mp4").to_string_lossy());
+        assert!(b.join("clip.mp4").exists() && !a.join("clip.mp4").exists());
+        let (path, folder): (String, String) = conn.query_row("SELECT path, folder FROM videos WHERE id='v1'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((path.as_str(), folder.as_str()), (m.path.as_str(), b.to_string_lossy().as_ref()));
+
+        // Name taken in the target: " (2)", nothing overwritten
+        let (m2, _) = move_video_file(&conn, "v2", &b).unwrap().unwrap();
+        assert_eq!(m2.filename, "same (2).mp4");
+        assert_eq!(std::fs::read(b.join("same.mp4")).unwrap(), b"already in B");
+        assert_eq!(std::fs::read(b.join("same (2).mp4")).unwrap(), b"two");
+
+        // Already there: nothing to do
+        assert!(move_video_file(&conn, "v1", &b).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::reconcile_renames;
+    use rusqlite::params;
+
+    #[test]
+    fn finder_renames_keep_their_entries() {
+        let dir = std::env::temp_dir().join(format!("vv-ren-{}", uuid::Uuid::new_v4()));
+        let (a, b) = (dir.join("Trips"), dir.join("Holidays"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let conn = crate::db::init_db(&dir.join("t.db").to_string_lossy()).unwrap();
+        let row = |id: &str, folder: &std::path::Path, name: &str, size: i64| {
+            conn.execute(
+                "INSERT INTO videos (id, path, filename, folder, size_bytes, indexed_at) VALUES (?1, ?2, ?3, ?4, ?5, 'now')",
+                params![id, folder.join(name).to_string_lossy(), name, folder.to_string_lossy(), size],
+            ).unwrap();
+        };
+        let p = |f: &std::path::Path, n: &str| f.join(n).to_string_lossy().to_string();
+        // On disk now: beach.mp4 renamed in place, city.mp4 moved to Holidays,
+        // and two same-size files that can't be told apart
+        row("r", &a, "beach.mp4", 5);
+        std::fs::write(a.join("Beach day.mp4"), b"12345").unwrap();
+        row("m", &a, "city.mp4", 3);
+        std::fs::write(b.join("city.mp4"), b"abc").unwrap();
+        row("x", &a, "x.mp4", 2);
+        std::fs::write(b.join("y1.mp4"), b"zz").unwrap();
+        std::fs::write(b.join("y2.mp4"), b"zz").unwrap();
+
+        let missing = vec![p(&a, "beach.mp4"), p(&a, "city.mp4"), p(&a, "x.mp4")];
+        let new_files = vec![p(&a, "Beach day.mp4"), p(&b, "city.mp4"), p(&b, "y1.mp4"), p(&b, "y2.mp4")];
+        let (renamed, _) = reconcile_renames(&conn, &missing, &new_files);
+
+        let get = |id: &str| conn.query_row("SELECT path, folder FROM videos WHERE id = ?1", params![id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap();
+        assert_eq!(get("r").0, p(&a, "Beach day.mp4"), "renamed in its folder");
+        assert_eq!(get("m"), (p(&b, "city.mp4"), b.to_string_lossy().to_string()), "moved, same name");
+        assert_eq!(get("x").0, p(&a, "x.mp4"), "ambiguous: left alone");
+        assert_eq!(renamed.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn split_renames_are_rejoined() {
+        let dir = std::env::temp_dir().join(format!("vv-rejoin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::db::init_db(&dir.join("t.db").to_string_lossy()).unwrap();
+        let p = |n: &str| dir.join(n).to_string_lossy().to_string();
+        std::fs::write(dir.join("clip.mp4"), b"12345").unwrap();
+        // Old entry: deleted, file gone ("clip 2.mp4" was renamed), in a collection, played
+        conn.execute("INSERT INTO videos (id, path, filename, folder, size_bytes, indexed_at, is_deleted, play_count) VALUES ('old', ?1, 'clip 2.mp4', ?2, 5, 'now', 1, 3)", params![p("clip 2.mp4"), dir.to_string_lossy()]).unwrap();
+        conn.execute("INSERT INTO collections (id, name, created_at) VALUES ('c', 'Best', 'now')", []).unwrap();
+        conn.execute("INSERT INTO collection_videos (collection_id, video_id, position) VALUES ('c', 'old', 0)", []).unwrap();
+        // New entry for the renamed file, without them
+        conn.execute("INSERT INTO videos (id, path, filename, folder, size_bytes, indexed_at) VALUES ('new', ?1, 'clip.mp4', ?2, 5, 'now')", params![p("clip.mp4"), dir.to_string_lossy()]).unwrap();
+
+        assert_eq!(super::rejoin_split_renames(&conn), 1);
+        let plays: i64 = conn.query_row("SELECT play_count FROM videos WHERE id='new'", [], |r| r.get(0)).unwrap();
+        let in_collection: i64 = conn.query_row("SELECT COUNT(*) FROM collection_videos WHERE video_id='new'", [], |r| r.get(0)).unwrap();
+        let old_left: i64 = conn.query_row("SELECT COUNT(*) FROM videos WHERE id='old'", [], |r| r.get(0)).unwrap();
+        assert_eq!((plays, in_collection, old_left), (3, 1, 0));
+        assert_eq!(super::rejoin_split_renames(&conn), 0, "nothing left to rejoin");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// Save the frame shown at `time_secs` as a full-size PNG (to use as an image
+/// in Create); returns its path. Kept in the app's cache; a generation copies
+/// it into Mage/References when it's used.
+#[tauri::command]
+pub async fn extract_frame(path: String, time_secs: f64, app: tauri::AppHandle) -> Result<String, String> {
+    use tauri::Manager;
+    let dir = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("frames");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let stem = Path::new(&path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "frame".into());
+    let out = dir.join(format!("{}_{:.2}s.png", stem, time_secs.max(0.0)));
+    let out_s = out.to_string_lossy().to_string();
+    tokio::task::block_in_place(|| ffmpeg::extract_frame(&path, time_secs, &out_s)).map_err(|e| e.to_string())?;
+    Ok(out_s)
 }

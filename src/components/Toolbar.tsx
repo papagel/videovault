@@ -3,9 +3,10 @@ import { useShallow } from 'zustand/react/shallow'
 import {
   Grid3X3, List, Merge,
   Scissors, Tag, Trash2, SortAsc, SortDesc, ChevronDown,
-  PanelLeftClose, PanelLeft, Library, Sparkles, Gem, Loader2, Timer, Film, X,
+  PanelLeftClose, PanelLeft, Library, Sparkles, Gem, Loader2, Timer, Film, X, CloudDownload,
 } from 'lucide-react'
 import { FolderPicker } from './FolderPicker'
+import { ImportPanel } from './create/ImportPanel'
 import { MIX_SPLITS, finishTask, mixProblem, quickMix, splitLabel, startIntroMerges } from '@/lib/merge'
 import { useStore } from '@/store'
 import { cn } from '@/lib/utils'
@@ -41,6 +42,7 @@ export function Toolbar() {
   )
 
   const selectedCount = selectedVideoIds.size
+  const [importOpen, setImportOpen] = useState(false)
 
   const handleDeleteSelected = () => {
     const ids = [...selectedVideoIds]
@@ -82,6 +84,15 @@ export function Toolbar() {
       <div className="flex-shrink-0 flex items-center gap-2 px-4 h-12 border-b border-[#2a2a3a] bg-[#0d0d14]">
         {modeSwitch}
         <div className="flex-1" />
+        <TaskStatus />
+        <button
+          onClick={() => setImportOpen(true)}
+          className="flex items-center gap-1.5 text-xs text-[#8888aa] hover:text-white bg-[#16161f] border border-[#2a2a3a] hover:border-[#3a3a5a] rounded-lg px-2.5 py-1.5 transition-all"
+          title="Import generations made on Mage (website included), with prompts and references"
+        >
+          <CloudDownload size={13} /> Import from Mage
+        </button>
+        {importOpen && <ImportPanel onClose={() => setImportOpen(false)} />}
         {mageBalance != null && (
           <span className="flex items-center gap-1.5 text-xs text-[#8888aa] bg-[#16161f] border border-[#2a2a3a] rounded-lg px-2.5 py-1.5 tabular-nums" title="Mage Gems balance">
             <Gem size={12} className="text-[#6366f1]" />

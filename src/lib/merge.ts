@@ -224,3 +224,58 @@ export async function startIntroMerges(videos: VideoFile[]) {
     detail: [...saved, ...skipped.map((x) => `Skipped ${x}`), ...failed.map((x) => `Failed ${x}`)].join('\n'),
   })
 }
+
+// ── Join an extension with its original ─────────────────────────────────────
+
+/**
+ * Play an extended video's whole chain back to back (original, extension,
+ * extension of the extension…) as one video, dropping the repeated frame at
+ * each seam (an extension starts on its original's last frame). Saved in
+ * Mage/Merged as the next video_merge_NN.mp4, then played.
+ */
+export async function joinWithOriginal(g: MageGeneration) {
+  const generations = await ensureGenerations()
+  const chain: MageGeneration[] = []
+  const seen = new Set<string>()
+  for (let cur: MageGeneration | undefined = g; cur && !seen.has(cur.id); ) {
+    seen.add(cur.id)
+    chain.unshift(cur)
+    const parent: string | null = cur.extends_id
+    cur = parent ? generations.find((x) => x.id === parent) : undefined
+  }
+  const parts = chain.filter((x) => x.local_path)
+  const label = 'Join'
+  if (parts.length < 2) {
+    finishTask({ label, error: "the original video isn't on this Mac" })
+    return
+  }
+  const unlisten = await listen<number>('merge-progress', (e) =>
+    useStore.getState().setTaskStatus({ label: `Join ${parts.length} videos`, progress: e.payload })
+  )
+  useStore.getState().setTaskStatus({ label: `Join ${parts.length} videos`, progress: 0 })
+  try {
+    const path = await invoke<string>('merge_videos', {
+      request: {
+        clips: parts.map((x, i) => ({
+          video_id: x.video_id ?? `file:${x.id}`,
+          path: x.local_path,
+          // Skip the first frame of each extension: it repeats the last one
+          start_offset_secs: i === 0 ? 0 : 0.02,
+          duration_secs: null,
+        })),
+        output_filename: null,
+        output_folder: parts[0].local_path!.split('/').slice(0, -1).join('/'),
+        total_duration_secs: null,
+        quality: useStore.getState().settings.mergeQuality,
+      },
+    })
+    const video = await invoke<VideoFile>('index_video_path', { path })
+    useStore.getState().addVideos([video])
+    finishTask({ label, message: `${parts.length} videos → ${video.filename}`, detail: path })
+    useStore.getState().playVideo(video, [video], { selectOnClose: false })
+  } catch (e) {
+    finishTask({ label, error: String(e) })
+  } finally {
+    unlisten()
+  }
+}

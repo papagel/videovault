@@ -1,10 +1,11 @@
-import { useState, useRef, useMemo, useCallback } from 'react'
+import { useState, useRef, useMemo, useCallback, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
-import { showConfirm } from '@/lib/dialog'
+import { showConfirm, showPrompt } from '@/lib/dialog'
+import { VIDEOS_MIME, moveVideosTo, newFolderIn, refreshEmptyFolders } from '@/lib/library'
 import {
   FolderOpen, ListVideo, Plus, ChevronRight, ChevronDown,
-  Folder, Settings, Film, X, Search, RefreshCw,
+  Folder, Settings, Film, X, Search, RefreshCw, FolderPlus,
 } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '@/store'
@@ -16,6 +17,7 @@ export function Sidebar() {
     sidebarOpen,
     sidebarWidth,
     activeFolders,
+    emptyFolders,
     toggleActiveFolder,
     setActiveFolders,
     setLetterFilter,
@@ -46,6 +48,7 @@ export function Sidebar() {
       sidebarOpen: s.sidebarOpen,
       sidebarWidth: s.sidebarWidth,
       activeFolders: s.activeFolders,
+      emptyFolders: s.emptyFolders,
       toggleActiveFolder: s.toggleActiveFolder,
       setActiveFolders: s.setActiveFolders,
       setLetterFilter: s.setLetterFilter,
@@ -175,7 +178,7 @@ export function Sidebar() {
     for (const root of rootFolders) {
       const prefix = root + '/'
       const found = new Set<string>()
-      for (const f of exact.keys()) {
+      for (const f of [...exact.keys(), ...emptyFolders]) {
         if (!f.startsWith(prefix)) continue
         const parts = f.slice(prefix.length).split('/')
         for (let i = 1; i <= parts.length; i++) found.add(prefix + parts.slice(0, i).join('/'))
@@ -190,7 +193,7 @@ export function Sidebar() {
       })
     }
     return { subfoldersByRoot: subs, exactFolderCounts: exact }
-  }, [videos, rootFolders])
+  }, [videos, rootFolders, emptyFolders])
 
   const videoCount = (path: string) => {
     const prefix = path + '/'
@@ -202,6 +205,38 @@ export function Sidebar() {
   }
 
   const isFiltering = !!(activeFolders.length || activeCollection || activeTags.length || searchQuery)
+
+  // Empty folders show too (e.g. a new one), reloaded when the folders change
+  useEffect(() => { refreshEmptyFolders() }, [watchedFolders])
+
+  // ── Drop videos on a folder to move them; make new folders ──────────────
+  const [dropTarget, setDropTarget] = useState<string | null>(null)
+  const dropProps = (folder: string) => ({
+    onDragOver: (e: React.DragEvent) => {
+      if (!e.dataTransfer.types.includes(VIDEOS_MIME)) return
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'move'
+      if (dropTarget !== folder) setDropTarget(folder)
+    },
+    onDragLeave: (e: React.DragEvent) => {
+      if (!e.currentTarget.contains(e.relatedTarget as Node)) setDropTarget((t) => (t === folder ? null : t))
+    },
+    onDrop: (e: React.DragEvent) => {
+      setDropTarget(null)
+      const raw = e.dataTransfer.getData(VIDEOS_MIME)
+      if (!raw) return
+      e.preventDefault()
+      try {
+        moveVideosTo(JSON.parse(raw) as string[], folder)
+      } catch { /* not ours */ }
+    },
+  })
+  const addFolderIn = async (parent: string, root: string, e: React.MouseEvent) => {
+    e.stopPropagation()
+    const path = await newFolderIn(parent, (title) => showPrompt(title, 'Folder name'))
+    // Show the new folder: open its root's subfolder list
+    if (path && condensedFolders.has(root)) toggleFolderCondensed(root)
+  }
 
   /**
    * Plain click shows just this folder (again to show all); ⌘/Ctrl/Shift-click
@@ -304,11 +339,14 @@ export function Sidebar() {
                 <div
                   onClick={(e) => clickFolder(root, e)}
                   title={folderTitle(root)}
+                  {...dropProps(root)}
                   className={cn(
                     'group/folder flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer transition-all',
-                    activeFolders.includes(root)
-                      ? 'text-[#6366f1] bg-[#6366f1]/10'
-                      : 'text-[#8888aa] hover:text-white hover:bg-[#1e1e2a]'
+                    dropTarget === root
+                      ? 'text-white bg-[#6366f1]/25 ring-1 ring-inset ring-[#6366f1]'
+                      : activeFolders.includes(root)
+                        ? 'text-[#6366f1] bg-[#6366f1]/10'
+                        : 'text-[#8888aa] hover:text-white hover:bg-[#1e1e2a]'
                   )}
                 >
                   {/* Folder icon doubles as the expand/collapse toggle */}
@@ -337,6 +375,13 @@ export function Sidebar() {
                     {videoCount(root)}
                   </span>
                   <button
+                    onClick={(e) => addFolderIn(root, root, e)}
+                    className="hidden group-hover/folder:flex text-[#55556a] hover:text-[#6366f1] transition-all"
+                    title="New folder inside"
+                  >
+                    <FolderPlus size={11} />
+                  </button>
+                  <button
                     onClick={(e) => handleRescanFolder(root, e)}
                     className="hidden group-hover/folder:flex text-[#55556a] hover:text-[#6366f1] transition-all"
                     title="Rescan folder (sync added/removed files)"
@@ -358,18 +403,28 @@ export function Sidebar() {
                       key={sub}
                       onClick={(e) => clickFolder(sub, e)}
                       title={folderTitle(sub)}
+                      {...dropProps(sub)}
                       className={cn(
-                        'flex items-center gap-1.5 py-1 pr-3 text-xs cursor-pointer transition-all',
-                        activeFolders.includes(sub)
-                          ? 'text-[#6366f1] bg-[#6366f1]/10'
-                          : 'text-[#55556a] hover:text-[#8888aa] hover:bg-[#1e1e2a]'
+                        'group/sub flex items-center gap-1.5 py-1 pr-3 text-xs cursor-pointer transition-all',
+                        dropTarget === sub
+                          ? 'text-white bg-[#6366f1]/25 ring-1 ring-inset ring-[#6366f1]'
+                          : activeFolders.includes(sub)
+                            ? 'text-[#6366f1] bg-[#6366f1]/10'
+                            : 'text-[#55556a] hover:text-[#8888aa] hover:bg-[#1e1e2a]'
                       )}
                       style={{ paddingLeft: 12 + depth * 10 }}
                     >
                       <span className="text-[#2a2a3a] text-[10px]">└</span>
                       <Folder size={10} className="flex-shrink-0" />
                       <OverflowName className="flex-1">{sub.split('/').pop() ?? ''}</OverflowName>
-                      <span className="text-[#3a3a5a] tabular-nums text-[10px]">{videoCount(sub)}</span>
+                      <span className="text-[#3a3a5a] tabular-nums text-[10px] group-hover/sub:hidden">{videoCount(sub)}</span>
+                      <button
+                        onClick={(e) => addFolderIn(sub, root, e)}
+                        className="hidden group-hover/sub:flex text-[#55556a] hover:text-[#6366f1] transition-all"
+                        title="New folder inside"
+                      >
+                        <FolderPlus size={11} />
+                      </button>
                     </div>
                   )
                 })}

@@ -9,6 +9,7 @@ import { VideoGrid } from '@/components/VideoGrid'
 import { Player } from '@/components/Player'
 import { MergeModal } from '@/components/MergeModal'
 import { IntroPicker } from '@/components/IntroPicker'
+import { ImagePreview } from '@/components/ImagePreview'
 import { TrimModal } from '@/components/TrimModal'
 import { TagModal } from '@/components/TagModal'
 import { SettingsModal } from '@/components/SettingsModal'
@@ -87,6 +88,7 @@ const AppWrapper = () => {
     let unlistenTags: (() => void) | undefined
     let unlistenFolders: (() => void) | undefined
     let unlistenMageRenamed: (() => void) | undefined
+    let unlistenRenamed: (() => void) | undefined
 
     const t = setTimeout(async () => {
       try {
@@ -131,6 +133,15 @@ const AppWrapper = () => {
           invoke<Tag[]>('get_all_tags').then((t) => useStore.getState().setTags(t)).catch(console.warn)
         })
 
+        // Renamed or moved outside the app (Finder): same video, new path
+        unlistenRenamed = await listen<{ video_id: string; path: string; filename: string; folder: string }>(
+          'video-renamed',
+          (e) => {
+            const { video_id, path, filename, folder } = e.payload
+            useStore.getState().updateVideo(video_id, { path, filename, folder })
+          }
+        )
+
         // A renamed generated video: reload the Create gallery's paths
         unlistenMageRenamed = await listen('mage-generations-changed', () => {
           invoke<MageGeneration[]>('mage_list_generations')
@@ -159,6 +170,7 @@ const AppWrapper = () => {
       unlistenTags?.()
       unlistenFolders?.()
       unlistenMageRenamed?.()
+      unlistenRenamed?.()
     }
   }, [])
 
@@ -324,6 +336,7 @@ const AppWrapper = () => {
 
       <MergeModal />
       <IntroPicker />
+      <ImagePreview />
       <TagModal />
       <SettingsModal />
       <EntityModal />

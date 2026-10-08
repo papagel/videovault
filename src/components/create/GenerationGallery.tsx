@@ -1,18 +1,18 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import {
   Loader2, AlertTriangle, Ban, RotateCcw, Shuffle, FolderOpen, Trash2,
-  ImagePlus, Clapperboard, UserPlus, Gem, X, Square, Play, Crop, Maximize2, Search, Film, CloudDownload,
+  ImagePlus, Clapperboard, UserPlus, Gem, X, Square, Play, Crop, Maximize2, Search, Film, StepForward, Link2,
 } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '@/store'
 import { showConfirm } from '@/lib/dialog'
-import { cn, getThumbnailSrc, getVideoSrc } from '@/lib/utils'
-import { FINAL_STATUSES, isRetryable, remixGeneration, shortTime, statusLabel } from '@/lib/mage'
+import { cn, formatDuration, getThumbnailSrc, getVideoSrc } from '@/lib/utils'
+import { FINAL_STATUSES, extendGeneration, isRetryable, remixGeneration, shortTime, statusLabel } from '@/lib/mage'
 import { videoForGeneration } from '@/lib/intro'
-import { startIntroMerges } from '@/lib/merge'
+import { joinWithOriginal, startIntroMerges } from '@/lib/merge'
 import { DRAG_MIME } from './StudioPanel'
-import { ImportPanel } from './ImportPanel'
+import { FrameGrab } from '../FrameGrab'
 import type { MageGeneration, MageThumbSize } from '@/types'
 
 type Filter = 'all' | 'image' | 'video'
@@ -34,21 +34,35 @@ export function GenerationGallery() {
   const architectures = useStore((s) => s.mageArchitectures)
   const [filter, setFilter] = useState<Filter>('all')
   const [query, setQuery] = useState('')
+  /** Videos of this length (whole seconds) only */
+  const [length, setLength] = useState<number | null>(null)
   const [viewing, setViewing] = useState<MageGeneration | null>(null)
-  const [importOpen, setImportOpen] = useState(false)
+
+  // Video lengths in whole seconds, as the length menu offers them
+  const lengthOf = (g: MageGeneration) => (g.duration_secs != null ? Math.round(g.duration_secs) : null)
+  const lengths = useMemo(() => {
+    const counts = new Map<number, number>()
+    for (const g of generations) {
+      const l = g.media_type === 'video' ? lengthOf(g) : null
+      if (l != null) counts.set(l, (counts.get(l) ?? 0) + 1)
+    }
+    return [...counts.entries()].sort((a, b) => a[0] - b[0])
+  }, [generations])
 
   const shown = useMemo(() => {
     const words = query.toLowerCase().split(/\s+/).filter(Boolean)
     const names = new Map(architectures.map((a) => [a.id, a.name]))
     return generations.filter((g) => {
       if (filter !== 'all' && g.media_type !== filter) return false
+      // A length shows videos of that length only
+      if (length != null && (g.media_type !== 'video' || lengthOf(g) !== length)) return false
       if (words.length === 0) return true
       // Every word must match the prompt, model or status
       const text = [g.prompt, names.get(g.architecture), g.architecture, g.model_id, g.status]
         .filter(Boolean).join(' ').toLowerCase()
       return words.every((w) => text.includes(w))
     })
-  }, [generations, filter, query, architectures])
+  }, [generations, filter, query, architectures, length])
   const anyRunning = generations.some((g) => !FINAL_STATUSES.has(g.status))
   const now = useTick(anyRunning)
 
@@ -75,15 +89,24 @@ export function GenerationGallery() {
           placeholder={filter === 'image' ? 'Search images' : filter === 'video' ? 'Search videos' : 'Search prompts, models'}
           className="w-44"
         />
+        {lengths.length > 0 && filter !== 'image' && (
+          <select
+            value={length ?? ''}
+            onChange={(e) => setLength(e.target.value === '' ? null : Number(e.target.value))}
+            title="Show videos of one length"
+            className={cn(
+              'h-7 bg-[#16161f] border rounded-lg px-2 text-[11px] outline-none',
+              length != null ? 'border-[#6366f1] text-white' : 'border-[#2a2a3a] text-[#8888aa]'
+            )}
+          >
+            <option value="">Any length</option>
+            {lengths.map(([secs, n]) => (
+              <option key={secs} value={secs}>{secs}s · {n}</option>
+            ))}
+          </select>
+        )}
         <span className="text-[11px] text-[#55556a] tabular-nums">{shown.length}</span>
         <div className="flex-1" />
-        <button
-          onClick={() => setImportOpen(true)}
-          className="flex items-center gap-1.5 text-[11px] text-[#8888aa] hover:text-white bg-[#16161f] border border-[#2a2a3a] hover:border-[#3a3a5a] rounded-lg px-2 py-1"
-          title="Import generations made on Mage (website included), with prompts and references"
-        >
-          <CloudDownload size={12} /> Import from Mage
-        </button>
         <button
           onClick={() => updateSettings({ mageThumbFit: thumbFit === 'cover' ? 'contain' : 'cover' })}
           className="p-1.5 rounded-lg border border-[#2a2a3a] bg-[#16161f] text-[#8888aa] hover:text-white"
@@ -147,7 +170,6 @@ export function GenerationGallery() {
       </div>
 
       {viewing && <Viewer g={viewing} onClose={() => setViewing(null)} />}
-      {importOpen && <ImportPanel onClose={() => setImportOpen(false)} />}
     </div>
   )
 }
@@ -224,6 +246,16 @@ function GenerationCard({
       : { mediaType: 'video', architecture: null, config: {}, firstFrame: g.local_path! })
   })
   const makeCharacter = act(async () => setEntityModal({ type: 'character', filePath: g.local_path! }))
+  const extendArch = architectures.find((a) => a.id === g.architecture)
+  const canExtend = !!(extendArch?.image_inputs.first_frame || extendArch?.image_inputs.references)
+  const extend = act(async () => {
+    try {
+      await extendGeneration(g)
+    } catch (e) {
+      useStore.getState().setTaskStatus({ label: 'Extend', error: e instanceof Error ? e.message : String(e) })
+    }
+  })
+  const join = act(() => joinWithOriginal(g))
   const mergeWithIntro = act(async () => {
     const video = await videoForGeneration(g)
     if (video) startIntroMerges([video])
@@ -264,6 +296,11 @@ function GenerationCard({
             />
             <span className="absolute bottom-1.5 left-1.5 flex items-center gap-1 px-1.5 py-0.5 rounded bg-black/70 text-[10px] text-white">
               <Play size={9} /> Video
+              {g.duration_secs != null && (
+                <span className="tabular-nums">
+                  · {g.duration_secs < 59.5 ? `${Math.round(g.duration_secs)}s` : formatDuration(g.duration_secs)}
+                </span>
+              )}
             </span>
           </>
         )}
@@ -294,6 +331,18 @@ function GenerationCard({
           {done && isImage && <CardAction icon={<ImagePlus size={12} />} title="Use as reference image" onClick={useAsReference} />}
           {done && isImage && <CardAction icon={<Clapperboard size={12} />} title="Animate: use as a video's first frame" onClick={animate} />}
           {done && isImage && <CardAction icon={<UserPlus size={12} />} title="Save as a Mage character" onClick={makeCharacter} />}
+          {done && !isImage && (
+            <CardAction
+              icon={<StepForward size={12} />}
+              title={canExtend
+                ? 'Extend: continue from its last frame with the same model and settings'
+                : `${archName} takes no images, so it can't extend a video`}
+              onClick={canExtend ? extend : (e) => e.stopPropagation()}
+            />
+          )}
+          {done && !isImage && g.extends_id && (
+            <CardAction icon={<Link2 size={12} />} title="Join with original: play it after the video it extends, as one video" onClick={join} />
+          )}
           {done && !isImage && <CardAction icon={<Film size={12} />} title="Merge with a character's intro on top" onClick={mergeWithIntro} />}
           {done && <CardAction icon={<FolderOpen size={12} />} title="Show in Finder" onClick={reveal} />}
           {!running && (
@@ -372,6 +421,7 @@ function CardAction({ icon, title, onClick }: { icon: React.ReactNode; title: st
 
 /** Full-size view. Videos already in the library open in the main Player. */
 function Viewer({ g, onClose }: { g: MageGeneration; onClose: () => void }) {
+  const viewerVideo = useRef<HTMLVideoElement>(null)
   const video = useStore((s) => (g.video_id ? s.videos.find((v) => v.id === g.video_id) : undefined))
 
   useEffect(() => {
@@ -400,7 +450,20 @@ function Viewer({ g, onClose }: { g: MageGeneration; onClose: () => void }) {
         {g.media_type === 'image' ? (
           <img src={getThumbnailSrc(g.local_path)} className="max-w-full max-h-[80vh] object-contain rounded-lg" alt="" />
         ) : (
-          <video src={getVideoSrc(g.local_path)} className="max-w-full max-h-[80vh] rounded-lg" controls autoPlay />
+          <>
+            <video ref={viewerVideo} src={getVideoSrc(g.local_path)} className="max-w-full max-h-[80vh] rounded-lg" controls autoPlay />
+            <div className="flex items-center gap-2 text-xs text-[#8888aa]">
+              <FrameGrab
+                path={g.local_path}
+                getTime={() => viewerVideo.current?.currentTime ?? 0}
+                onOpen={() => viewerVideo.current?.pause()}
+                onUsed={onClose}
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-[#2a2a3a] text-[#8888aa] hover:text-white hover:border-[#3a3a5a]"
+                iconSize={13}
+              />
+              <span className="text-[10px] text-[#55556a]">Use this frame in Create</span>
+            </div>
+          </>
         )}
         <p className="max-w-2xl text-center text-xs text-[#8888aa]">{g.prompt}</p>
         {g.seed != null && <p className="text-[10px] text-[#55556a]">Seed {g.seed}</p>}

@@ -7,6 +7,7 @@ import { showConfirm } from '@/lib/dialog'
 import { cn, getThumbnailSrc } from '@/lib/utils'
 import { defaultModelId, mentionedHandles, mentionSupport, removeMention, variantsOf } from '@/lib/mage'
 import { SearchBox } from './GenerationGallery'
+import { previewImages } from '@/lib/preview'
 import type { MageEntity } from '@/types'
 
 /**
@@ -172,10 +173,22 @@ export function EntityPanel() {
                 !supported(e) && !isSelected && 'opacity-45'
               )}
             >
-              <div className={cn(
-                'relative w-9 h-9 rounded-md bg-[#16161f] border overflow-hidden flex-shrink-0 flex items-center justify-center text-[#55556a]',
-                isSelected ? 'border-[#6366f1]' : 'border-[#2a2a3a]'
-              )}>
+              <div
+                onClick={(ev) => {
+                  // The picture previews; the rest of the row adds/removes the mention
+                  const withImage = list.filter((x) => x.local_image_path || x.image_url)
+                  const i = withImage.findIndex((x) => x.id === e.id)
+                  if (i < 0) return
+                  ev.stopPropagation()
+                  previewImages(withImage.map((x) => ({ path: (x.local_image_path ?? x.image_url)!, label: `${x.name} · @${x.handle}` })), i)
+                }}
+                title={e.local_image_path || e.image_url ? 'Preview' : undefined}
+                className={cn(
+                  'relative w-9 h-9 rounded-md bg-[#16161f] border overflow-hidden flex-shrink-0 flex items-center justify-center text-[#55556a]',
+                  isSelected ? 'border-[#6366f1]' : 'border-[#2a2a3a]',
+                  (e.local_image_path || e.image_url) && 'cursor-zoom-in hover:border-[#6366f1]'
+                )}
+              >
                 {isSelected && (
                   <span className="absolute top-0 right-0 z-10 w-3.5 h-3.5 rounded-bl-md bg-[#6366f1] text-white flex items-center justify-center">
                     <Check size={9} strokeWidth={3} />

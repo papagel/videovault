@@ -34,6 +34,12 @@ interface UIState {
   letterFilter: string | null
   /** Folders shown most recently, newest first (for the folder picker) */
   recentFolders: string[]
+  /** Full-size image preview: a group of images and the one shown */
+  imagePreview: { images: { src: string; label?: string }[]; index: number } | null
+  setImagePreview: (v: AppStore['imagePreview']) => void
+  /** Empty folders inside the library folders (shown in the sidebar too) */
+  emptyFolders: string[]
+  setEmptyFolders: (folders: string[]) => void
   activeTags: string[]
   tagFilterMode: 'and' | 'or'
   activeCollection: string | null
@@ -96,6 +102,8 @@ export interface MageDraft {
   references: string[]
   firstFrame: string | null
   lastFrame: string | null
+  /** Extending this generation: its last frame is the first frame */
+  extendsId: string | null
 }
 
 interface MageState {
@@ -209,6 +217,7 @@ const defaultMageDraft: MageDraft = {
   references: [],
   firstFrame: null,
   lastFrame: null,
+  extendsId: null,
 }
 
 /** Put a folder at the front of the recent list (kept to 8). */
@@ -255,6 +264,10 @@ export const useStore = create<AppStore>()(
       activeFolders: [],
       letterFilter: null,
       recentFolders: [],
+      emptyFolders: [],
+      imagePreview: null,
+      setImagePreview: (imagePreview) => set({ imagePreview }),
+      setEmptyFolders: (emptyFolders) => set({ emptyFolders }),
       activeTags: [],
       tagFilterMode: 'and',
       activeCollection: null,

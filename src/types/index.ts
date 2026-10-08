@@ -143,6 +143,10 @@ export interface MageGeneration {
   remote_id: string | null
   /** Where an imported generation was made: app, api, mcp, saved… */
   origin: string | null
+  /** The generation this one extends (continues from its last frame) */
+  extends_id: string | null
+  /** Length of a video result, read from the file */
+  duration_secs: number | null
 }
 
 /** A generation (last 30 days) or saved creation on Mage, for importing */

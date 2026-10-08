@@ -119,6 +119,19 @@ fn create_tables(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL
         );
 
+        -- What VideoVault sent to the website for a Run on website: the
+        -- copied prompt, settings and the local input images. An imported
+        -- result is matched back to its run, since Mage doesn't return inputs.
+        CREATE TABLE IF NOT EXISTS mage_website_runs (
+            id TEXT PRIMARY KEY,
+            prompt TEXT NOT NULL,
+            architecture TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            inputs_json TEXT NOT NULL,
+            handles_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
         -- References VideoVault saved on Mage only to carry images into a
         -- website run (@handle in a copied prompt); removed by Clean up and
         -- kept out of the characters/references list.
@@ -153,6 +166,10 @@ fn create_tables(conn: &Connection) -> Result<()> {
     for sql in [
         "ALTER TABLE mage_generations ADD COLUMN remote_id TEXT",
         "ALTER TABLE mage_generations ADD COLUMN origin TEXT",
+        // The generation this one continues ("Extend"), for "Join with original"
+        "ALTER TABLE mage_generations ADD COLUMN extends_id TEXT",
+        // Length of a video result, read from the file
+        "ALTER TABLE mage_generations ADD COLUMN duration_secs REAL",
     ] {
         let _ = conn.execute(sql, []);
     }

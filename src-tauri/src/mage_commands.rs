@@ -137,7 +137,7 @@ pub fn merged_dir_for(app: &AppHandle, clip_paths: &[String]) -> Option<String> 
 }
 
 /// `path`, or `name (2).ext`, `name (3).ext`… if it's taken.
-fn free_path(path: PathBuf) -> PathBuf {
+pub fn free_path(path: PathBuf) -> PathBuf {
     if !path.exists() {
         return path;
     }
@@ -428,6 +428,10 @@ pub struct Generation {
     pub remote_id: Option<String>,
     /// Where an imported generation was made: app, api, mcp…
     pub origin: Option<String>,
+    /// The generation this one extends (continues from its last frame)
+    pub extends_id: Option<String>,
+    /// Length of a video result, read from the file
+    pub duration_secs: Option<f64>,
     #[serde(skip)]
     idempotency_key: String,
     #[serde(skip)]
@@ -439,7 +443,7 @@ pub struct Generation {
 const GEN_COLUMNS: &str = "id, request_id, architecture, model_id, media_type, prompt,
     config_json, inputs_json, status, error, gems_charged, gems_refunded, seed, result_url,
     result_expires_at, local_path, width, height, video_id, created_at, updated_at,
-    idempotency_key, status_url, cancel_url, remote_id, origin";
+    idempotency_key, status_url, cancel_url, remote_id, origin, extends_id, duration_secs";
 
 fn row_to_generation(row: &rusqlite::Row) -> rusqlite::Result<Generation> {
     let parse = |s: String| serde_json::from_str(&s).unwrap_or(Value::Null);
@@ -470,6 +474,8 @@ fn row_to_generation(row: &rusqlite::Row) -> rusqlite::Result<Generation> {
         cancel_url: row.get(23)?,
         remote_id: row.get(24)?,
         origin: row.get(25)?,
+        extends_id: row.get(26)?,
+        duration_secs: row.get(27)?,
     })
 }
 
@@ -563,6 +569,9 @@ pub struct GenerateArgs {
     /// Local file paths per media field, e.g. `{"image": "/a.png",
     /// "additional_images": ["/b.png"], "first_image": "/c.jpg"}`.
     pub inputs: Map<String, Value>,
+    /// The generation this one continues ("Extend")
+    #[serde(default)]
+    pub extends_id: Option<String>,
 }
 
 #[tauri::command]
@@ -579,8 +588,8 @@ pub async fn mage_generate(args: GenerateArgs, app: AppHandle) -> Result<Generat
         conn.execute(
             "INSERT INTO mage_generations
              (id, idempotency_key, architecture, model_id, media_type, prompt, config_json,
-              inputs_json, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'uploading', ?9, ?9)",
+              inputs_json, status, created_at, updated_at, extends_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'uploading', ?9, ?9, ?10)",
             params![
                 id,
                 Uuid::new_v4().to_string(),
@@ -590,7 +599,8 @@ pub async fn mage_generate(args: GenerateArgs, app: AppHandle) -> Result<Generat
                 prompt,
                 Value::Object(args.config).to_string(),
                 inputs.to_string(),
-                ts
+                ts,
+                args.extends_id
             ],
         )
     })?;
@@ -617,6 +627,8 @@ pub async fn mage_estimate_cost(args: EstimateArgs, app: AppHandle) -> Result<ma
 
 #[tauri::command]
 pub async fn mage_list_generations(app: AppHandle) -> Result<Vec<Generation>, String> {
+    // Results deleted outside the app since startup drop out
+    tokio::task::block_in_place(|| prune_removed_results(&app));
     with_conn(&app, |conn| {
         let mut stmt = conn.prepare(&format!(
             "SELECT {} FROM mage_generations ORDER BY created_at DESC LIMIT 500",
@@ -939,12 +951,17 @@ async fn finish_download(app: &AppHandle, g: &Generation) -> Result<(), String> 
 
     let to_library = g.media_type == "video" && with_conn(app, |conn| Ok(adds_to_library(conn)))?;
     let video_id = if to_library { add_to_library(app, &path, &g.prompt) } else { None };
+    let duration = (g.media_type != "image")
+        .then(|| tokio::task::block_in_place(|| crate::ffmpeg::probe_video(&path).ok()))
+        .flatten()
+        .map(|m| m.duration_secs)
+        .filter(|d| *d > 0.0);
 
     with_conn(app, |conn| {
         conn.execute(
             "UPDATE mage_generations SET local_path = ?1, video_id = ?2, status = 'completed',
-             updated_at = ?3 WHERE id = ?4",
-            params![path, video_id, now(), g.id],
+             duration_secs = ?3, updated_at = ?4 WHERE id = ?5",
+            params![path, video_id, duration, now(), g.id],
         )
     })?;
     emit_generation(app, &g.id);
@@ -1645,6 +1662,44 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn imports_find_their_website_run() {
+        let dir = std::env::temp_dir().join(format!("vv-runs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::db::init_db(&dir.join("t.db").to_string_lossy()).unwrap();
+        let add = |prompt: &str, handles: &[&str], when: &str| {
+            conn.execute(
+                "INSERT INTO mage_website_runs (id, prompt, architecture, config_json, inputs_json, handles_json, created_at)
+                 VALUES (?1, ?2, 'lemon', ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(), prompt,
+                    json!({ "aspect_ratio": "3:4", "duration": "8" }).to_string(),
+                    json!({ "image": "/a.png", "additional_images": ["/b.png"] }).to_string(),
+                    json!(handles).to_string(), when,
+                ],
+            ).unwrap();
+        };
+        add("@ana walks past @vvimg1-k3x9 and @VVIMG2-q7r2", &["vvimg1-k3x9", "vvimg2-q7r2"], "2026-10-08T10:00:00Z");
+        add("A red car at night", &[], "2026-10-08T09:00:00Z");
+        let item = |prompt: &str| {
+            let mut i = remote_from_history(&json!({ "history_id": "h", "architecture": "lemon", "status": "completed",
+                "created_at": "2026-10-08T11:00:00Z", "prompt": prompt }));
+            i.created_at = "2026-10-08T11:00:00Z".into();
+            i
+        };
+
+        // Edited on the website, but its temporary handle is still there
+        let run = super::find_website_run(&conn, &item("@ana slowly walks past @vvimg1-k3x9")).unwrap().unwrap();
+        assert_eq!(run.original_prompt(), "@ana walks past @image1 and @image2");
+        assert_eq!(run.config["aspect_ratio"], "3:4");
+        // No references: the same prompt (spacing and case aside) and model
+        assert!(super::find_website_run(&conn, &item("a red  car at NIGHT")).unwrap().is_some());
+        // Anything else: no match
+        assert!(super::find_website_run(&conn, &item("Something else")).unwrap().is_none());
+        assert_eq!(super::replace_mention("@vvimg1-k3x9, @vvimg1-k3x9x", "vvimg1-k3x9", "image1"), "@image1, @vvimg1-k3x9x");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn reads_mage_history_and_creations() {
         let answer = json!({
             "content": [{ "type": "text", "text": "2 items" }],
@@ -1906,6 +1961,19 @@ pub async fn mage_import_remote(items: Vec<RemoteItem>, app: AppHandle) -> Resul
         if let Some(m) = &item.model_id {
             config["model_id"] = json!(m);
         }
+        // Started with "Run on website"? Then its images and settings are known
+        let mut prompt = item.prompt.clone();
+        let mut inputs = json!({});
+        if let Some(run) = with_conn(&app, |conn| find_website_run(conn, &item))? {
+            prompt = run.original_prompt();
+            let mut c = run.config.clone();
+            c["prompt"] = json!(prompt);
+            if let Some(m) = &item.model_id {
+                c["model_id"] = json!(m);
+            }
+            config = c;
+            inputs = keep_input_copies(&app, &file_base(&item.created_at, &item.architecture, &id), &run.inputs);
+        }
         let inserted = with_conn(&app, |conn| {
             let exists: bool = conn
                 .query_row("SELECT 1 FROM mage_generations WHERE remote_id = ?1", params![item.remote_id], |_| Ok(true))
@@ -1919,11 +1987,12 @@ pub async fn mage_import_remote(items: Vec<RemoteItem>, app: AppHandle) -> Resul
                  (id, idempotency_key, architecture, model_id, media_type, prompt, config_json, inputs_json,
                   status, gems_charged, seed, result_url, result_expires_at, width, height,
                   created_at, updated_at, remote_id, origin)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '{}', 'downloading', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?18, 'downloading', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
-                    id, Uuid::new_v4().to_string(), item.architecture, item.model_id, media_type, item.prompt,
+                    id, Uuid::new_v4().to_string(), item.architecture, item.model_id, media_type, prompt,
                     config.to_string(), item.gems, item.seed, url, item.expires_at, item.width, item.height,
                     item.created_at, now(), item.remote_id, item.origin.clone().or(Some(item.kind.clone())),
+                    inputs.to_string(),
                 ],
             )?;
             Ok(true)
@@ -2208,4 +2277,220 @@ pub fn repair_renamed_results(app: &AppHandle) {
     if fixed > 0 {
         log::info!("Relinked {} renamed generation result(s)", fixed);
     }
+}
+
+// ── Extend ──────────────────────────────────────────────────────────────────
+
+/// The last frame of a generated video, saved as a PNG to start an
+/// extension from (the generation then keeps its own copy in References).
+#[tauri::command]
+pub async fn mage_last_frame(id: String, app: AppHandle) -> Result<String, String> {
+    let g = load_generation(&app, &id)?;
+    let video = g.local_path.filter(|p| Path::new(p).exists()).ok_or("This video isn't on this Mac")?;
+    let dir = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("frames");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let out = dir.join(format!("{}_last-frame.png", file_base(&g.created_at, &g.architecture, &g.id)));
+    let out_s = out.to_string_lossy().to_string();
+    tokio::task::block_in_place(|| crate::ffmpeg::extract_last_frame(&video, &out_s)).map_err(err)?;
+    Ok(out_s)
+}
+
+// ── Results removed outside the app ─────────────────────────────────────────
+
+/// Generations whose result file was removed outside the app (Finder,
+/// another app) leave the history, and their References copies go to the
+/// Trash. Only when the file's folder still exists: an unplugged drive or a
+/// moved Mage folder doesn't count as removed. Renames are relinked before
+/// this runs. Returns how many were removed.
+pub fn prune_removed_results(app: &AppHandle) -> usize {
+    let rows: Vec<(String, String, String)> = with_conn(app, |conn| {
+        conn.prepare("SELECT id, local_path, inputs_json FROM mage_generations WHERE local_path IS NOT NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect()
+    })
+    .unwrap_or_default();
+    let mut removed = 0;
+    for (id, path, inputs_json) in rows {
+        let p = Path::new(&path);
+        if p.exists() || !p.parent().is_some_and(|d| d.is_dir()) {
+            continue;
+        }
+        if with_conn(app, |conn| conn.execute("DELETE FROM mage_generations WHERE id = ?1", params![id])).is_err() {
+            continue;
+        }
+        removed += 1;
+        // Its input copies: References/<result name>/
+        let dirs: std::collections::HashSet<String> = serde_json::from_str::<Value>(&inputs_json)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .map(|o| {
+                o.values()
+                    .flat_map(|v| match v {
+                        Value::String(s) => vec![s.clone()],
+                        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+                        _ => vec![],
+                    })
+                    .filter(|s| s.contains(&format!("/{}/", SECTION_REFERENCES)))
+                    .filter_map(|s| Path::new(&s).parent().map(|d| d.to_string_lossy().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for d in dirs {
+            if Path::new(&d).is_dir() {
+                let _ = commands::move_to_trash(&d);
+            }
+        }
+    }
+    if removed > 0 {
+        log::info!("Removed {} generation(s) whose file was deleted outside the app", removed);
+    }
+    removed
+}
+
+// ── Matching imports to website runs ────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct WebsiteRunRecord {
+    /// The prompt as copied (with the temporary @handles)
+    pub prompt: String,
+    pub architecture: String,
+    /// Settings: model_id, aspect_ratio, resolution, duration…
+    pub config: Map<String, Value>,
+    /// Local images by field, as for a generation (`image`, `first_image`…)
+    pub inputs: Map<String, Value>,
+    /// Temporary reference handles, in @image order
+    pub handles: Vec<String>,
+}
+
+/// Remember what "Run on website" sent, to give the imported result its
+/// images and settings back.
+#[tauri::command]
+pub async fn mage_record_website_run(run: WebsiteRunRecord, app: AppHandle) -> Result<(), String> {
+    with_conn(&app, |conn| {
+        conn.execute(
+            "INSERT INTO mage_website_runs (id, prompt, architecture, config_json, inputs_json, handles_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                Uuid::new_v4().to_string(), run.prompt, run.architecture,
+                Value::Object(run.config).to_string(), Value::Object(run.inputs).to_string(),
+                json!(run.handles).to_string(), now(),
+            ],
+        )
+    })?;
+    Ok(())
+}
+
+pub struct RecordedRun {
+    prompt: String,
+    config: Value,
+    inputs: Value,
+    handles: Vec<String>,
+}
+
+impl RecordedRun {
+    /// The prompt as written in the Studio: temporary handles back to
+    /// @image1, @image2…, so a Remix uses the local images.
+    fn original_prompt(&self) -> String {
+        let mut p = self.prompt.clone();
+        for (i, h) in self.handles.iter().enumerate() {
+            p = replace_mention(&p, h, &format!("image{}", i + 1));
+        }
+        p
+    }
+}
+
+/// `@from` → `@to` wherever it's a whole mention (case-insensitive).
+fn replace_mention(text: &str, from: &str, to: &str) -> String {
+    let lower = text.to_lowercase();
+    let needle = format!("@{}", from.to_lowercase());
+    let mut out = String::new();
+    let mut i = 0;
+    while let Some(pos) = lower[i..].find(&needle) {
+        let start = i + pos;
+        let end = start + needle.len();
+        let next = lower[end..].chars().next();
+        let whole = !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        out.push_str(&text[i..start]);
+        if whole {
+            out.push('@');
+            out.push_str(to);
+        } else {
+            out.push_str(&text[start..end]);
+        }
+        i = end;
+    }
+    out.push_str(&text[i..]);
+    out
+}
+
+fn normalize_prompt(p: &str) -> String {
+    p.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// The website run an imported item came from: one whose temporary @handle
+/// appears in its prompt (survives edits on the website), else one with the
+/// same prompt and model, started before it. The latest wins.
+fn find_website_run(conn: &Connection, item: &RemoteItem) -> rusqlite::Result<Option<RecordedRun>> {
+    let rows: Vec<(String, String, String, String, String, String)> = conn
+        .prepare(
+            "SELECT prompt, architecture, config_json, inputs_json, handles_json, created_at
+             FROM mage_website_runs ORDER BY created_at DESC",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    let item_prompt = item.prompt.to_lowercase();
+    let item_norm = normalize_prompt(&item.prompt);
+    for (prompt, architecture, config, inputs, handles, created_at) in rows {
+        let handles: Vec<String> = serde_json::from_str(&handles).unwrap_or_default();
+        let by_handle = handles.iter().any(|h| {
+            let needle = format!("@{}", h.to_lowercase());
+            item_prompt.contains(&needle)
+        });
+        let by_prompt = handles.is_empty()
+            && architecture == item.architecture
+            && created_at <= item.created_at
+            && normalize_prompt(&prompt) == item_norm;
+        if by_handle || by_prompt {
+            return Ok(Some(RecordedRun {
+                prompt,
+                config: serde_json::from_str(&config).unwrap_or(json!({})),
+                inputs: serde_json::from_str(&inputs).unwrap_or(json!({})),
+                handles,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Read the length of video results that don't have it yet (made before it
+/// was recorded). Runs in the background at startup.
+pub fn backfill_durations(app: AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let rows: Vec<(String, String)> = with_conn(&app, |conn| {
+            conn.prepare(
+                "SELECT id, local_path FROM mage_generations
+                 WHERE media_type != 'image' AND local_path IS NOT NULL AND duration_secs IS NULL",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
+        })
+        .unwrap_or_default();
+        let mut done = 0;
+        for (id, path) in rows {
+            let Some(d) = crate::ffmpeg::probe_video(&path).ok().map(|m| m.duration_secs).filter(|d| *d > 0.0) else {
+                continue;
+            };
+            if with_conn(&app, |conn| {
+                conn.execute("UPDATE mage_generations SET duration_secs = ?1 WHERE id = ?2", params![d, id])
+            })
+            .is_ok()
+            {
+                done += 1;
+            }
+        }
+        if done > 0 {
+            let _ = app.emit("mage-generations-changed", ());
+        }
+    });
 }

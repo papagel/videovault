@@ -4,7 +4,7 @@ import { X } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '@/store'
 import { VideoCard } from './VideoCard'
-import { hasTags, inFolders, sortVideos } from '@/lib/library'
+import { VIDEOS_MIME, hasTags, inFolders, sortVideos } from '@/lib/library'
 import { VideoListRow } from './VideoListRow'
 import type { VideoFile } from '@/types'
 
@@ -379,8 +379,22 @@ export function VideoGrid() {
   const [reordering, setReordering] = useState(false)
 
   const handleDragStart = useCallback((e: React.DragEvent, videoId: string) => {
-    if (!activeCollection) return
+    // Drag to a sidebar folder moves the files: the whole selection when the
+    // card is part of it, else just this video
+    const { selectedVideoIds } = useStore.getState()
+    const ids = selectedVideoIds.has(videoId) ? [...selectedVideoIds] : [videoId]
+    e.dataTransfer.setData(VIDEOS_MIME, JSON.stringify(ids))
     e.dataTransfer.effectAllowed = 'move'
+    const badge = document.createElement('div')
+    badge.textContent = ids.length === 1 ? 'Move 1 video' : `Move ${ids.length} videos`
+    badge.style.cssText =
+      'position:fixed;top:-100px;left:-100px;padding:6px 10px;border-radius:8px;background:#6366f1;color:#fff;font:600 12px system-ui'
+    document.body.appendChild(badge)
+    e.dataTransfer.setDragImage(badge, 12, 12)
+    setTimeout(() => badge.remove(), 0)
+
+    // In a collection, dragging between cards also reorders it
+    if (!activeCollection) return
     e.dataTransfer.setData('text/plain', videoId)
     setDragVideoId(videoId)
   }, [activeCollection])
@@ -477,7 +491,6 @@ export function VideoGrid() {
   const items: React.ReactNode[] = []
   if (!showInitialSpinner && !showEmpty) {
     const { cols, itemW, cardH, stride } = layout
-    const isDraggableCollection = !!activeCollection
     for (let i = firstIdx; i <= lastIdx; i++) {
       const video = deferredVideos[i]
       if (!video) break
@@ -487,7 +500,7 @@ export function VideoGrid() {
         <div
           key={video.id}
           data-video-id={video.id}
-          draggable={isDraggableCollection}
+          draggable
           onDragStart={(e) => handleDragStart(e, video.id)}
           onDragOver={(e) => handleDragOverCard(e, i)}
           onDragEnd={handleDragEnd}

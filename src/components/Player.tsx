@@ -8,6 +8,7 @@ import { useStore } from '@/store'
 import { cn, formatDuration, getThumbnailSrc } from '@/lib/utils'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { PlayerContext } from './PlayerContext'
+import { FrameGrab } from './FrameGrab'
 
 export function Player() {
   const {
@@ -195,6 +196,18 @@ export function Player() {
           e.preventDefault()
           setShuffleEnabled(!shuffleEnabled)
           break
+        // Step one frame back / forward (pauses), to pick an exact frame
+        case ',':
+        case '.': {
+          e.preventDefault()
+          const el = videoRef.current
+          if (!el) break
+          el.pause()
+          setPlaying(false)
+          const step = 1 / (currentVideo.fps > 0 ? currentVideo.fps : 30)
+          el.currentTime = Math.max(0, Math.min(el.duration || Infinity, el.currentTime + (e.key === '.' ? step : -step)))
+          break
+        }
       }
     }
     window.addEventListener('keydown', handler)
@@ -387,6 +400,16 @@ export function Player() {
                   value={isMuted ? 0 : volume} onChange={handleVolumeChange} className="w-20" />
               </div>
 
+              {/* Use the frame on screen in Create */}
+              <FrameGrab
+                path={currentVideo.path}
+                getTime={() => videoRef.current?.currentTime ?? currentTime}
+                onOpen={() => { videoRef.current?.pause(); setPlaying(false) }}
+                onUsed={closePlayer}
+                className="text-white/70 hover:text-white"
+                iconSize={18}
+              />
+
               {/* Fullscreen */}
               <button onClick={toggleFullscreen} title="Fullscreen (F)"
                 className="text-white/70 hover:text-white transition-all">
@@ -410,7 +433,7 @@ export function Player() {
             'absolute top-4 left-4 text-xs text-white/30 transition-opacity',
             isFullscreen && !controlsVisible ? 'opacity-0' : 'opacity-100'
           )}>
-            Space · ←→ · J/L · M · F · S
+            Space · ←→ · J/L · M · F · S · , . frame
           </div>
         </div>
       )}

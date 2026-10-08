@@ -79,15 +79,29 @@ pub fn run() {
             app.manage(watcher_state);
             app.manage(MageKeyState(Mutex::new(None)));
 
+            // Renamed videos that were split into a deleted + a new entry
+            // before renames were recognized get their tags/collections back
+            {
+                let db = app.state::<commands::DbState>();
+                let n = db.0.lock().map(|conn| commands::rejoin_split_renames(&conn)).unwrap_or(0);
+                if n > 0 {
+                    log::info!("Rejoined {} renamed video(s) with their tags, collections and plays", n);
+                }
+            }
+
             // Older flat Mage folders are sorted into sections once
             mage_commands::reorganize_mage_folder(app.handle());
             // Generations whose result was renamed find it again
             mage_commands::repair_renamed_results(app.handle());
+            // …and the ones whose file was deleted outside the app drop out
+            mage_commands::prune_removed_results(app.handle());
 
             // Resume Mage generations that were in flight when the app quit
             mage_commands::resume_pending(app.handle().clone());
             // Copies of earlier generations' input images (once; then a no-op)
             mage_commands::backfill_input_copies(app.handle().clone());
+            // Lengths of earlier video results, for the gallery's duration filter
+            mage_commands::backfill_durations(app.handle().clone());
 
             Ok(())
         })
@@ -149,10 +163,16 @@ pub fn run() {
             mage_commands::mage_prepare_website_run,
             mage_commands::mage_temp_ref_count,
             mage_commands::mage_cleanup_temp_refs,
+            mage_commands::mage_last_frame,
+            mage_commands::mage_record_website_run,
             mage_commands::mage_clear_entity_intro,
             commands::probe_media,
             commands::index_video_path,
             commands::open_url_in,
+            commands::move_videos,
+            commands::create_folder,
+            commands::list_empty_folders,
+            commands::extract_frame,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

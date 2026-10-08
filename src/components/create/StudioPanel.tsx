@@ -13,6 +13,7 @@ import {
   mentionedHandles, mentionSupport, optionFields, parseRatio, removeMention, tokenLabel, variantsOf,
 } from '@/lib/mage'
 import { PromptInput } from './PromptInput'
+import { previewImages } from '@/lib/preview'
 import type { MageArchitecture, MageCostEstimate, MageEntity, MageGeneration } from '@/types'
 
 /** Preferred starting model per media type; falls back to the first listed. */
@@ -204,6 +205,15 @@ function StudioForm({
     updateDraft({ references: refList, firstFrame: first, lastFrame: last })
   }
 
+  /** First and last frame as one preview group */
+  const previewFrames = (which: 'first' | 'last') => {
+    const group = [
+      ...(draft.firstFrame ? [{ path: draft.firstFrame, label: 'First frame' }] : []),
+      ...(draft.lastFrame ? [{ path: draft.lastFrame, label: 'Last frame' }] : []),
+    ]
+    previewImages(group, which === 'last' && draft.firstFrame ? 1 : 0)
+  }
+
   /** Move both frames into the reference list (models that refuse the mix) */
   const framesToReferences = () => {
     for (const [slot, path] of [['first', draft.firstFrame], ['last', draft.lastFrame]] as const) {
@@ -252,9 +262,11 @@ function StudioForm({
     setSubmitting(true)
     try {
       const g = await invoke<MageGeneration>('mage_generate', {
-        args: { architecture: arch.id, media_type: arch.type, config, inputs },
+        args: { architecture: arch.id, media_type: arch.type, config, inputs, extends_id: draft.extendsId },
       })
       upsertGeneration(g)
+      // The extension is on its way; the next generation starts fresh
+      if (draft.extendsId) updateDraft({ extendsId: null })
     } catch (e) {
       setError(String(e))
     } finally {
@@ -285,6 +297,14 @@ function StudioForm({
       />
 
       <div className="flex-1 overflow-y-auto px-4 pb-4 space-y-4">
+        {draft.extendsId && (
+          <ExtendingNote
+            original={generations.find((x) => x.id === draft.extendsId)}
+            mode={draft.firstFrame ? 'frame' : draft.references.length ? 'reference' : 'none'}
+            onCancel={() => updateDraft({ extendsId: null })}
+          />
+        )}
+
         {/* Model */}
         <Field label="Model">
           <Select
@@ -383,6 +403,7 @@ function StudioForm({
                   onPick={async () => { const [p] = await pickImages(false); if (p) placeImage(p, null, 'first') }}
                   onPlace={placeImage}
                   onClear={() => updateDraft({ firstFrame: null })}
+                  onPreview={() => previewFrames('first')}
                 />
               </Field>
             )}
@@ -395,6 +416,7 @@ function StudioForm({
                   onPick={async () => { const [p] = await pickImages(false); if (p) placeImage(p, null, 'last') }}
                   onPlace={placeImage}
                   onClear={() => updateDraft({ lastFrame: null })}
+                  onPreview={() => previewFrames('last')}
                 />
               </Field>
             )}
@@ -414,6 +436,7 @@ function StudioForm({
                     moves={slots.filter((t) => t !== 'ref')}
                     onMove={(to) => placeImage(p, 'ref', to)}
                     onClear={() => updateDraft({ references: references.filter((x) => x !== p) })}
+                    onPreview={() => previewImages(references.map((path, n) => ({ path, label: `@image${n + 1}` })), i)}
                   />
                 ))}
                 {references.length < refCapacity && (
@@ -543,6 +566,9 @@ function StudioForm({
                   : `~${Math.round(arch.gems)} gems at default settings`}
         </p>
         <RunOnWebsite
+          architecture={arch.id}
+          runConfig={config}
+          runInputs={inputs}
           prompt={draft.prompt.trim()}
           modelLabel={`${arch.name}${variants.length > 1 && modelId ? ` (${modelId})` : ''}`}
           settings={fields.map(({ field, tokens }) => `${fieldLabel(field)} ${tokenLabel(field, valueOf(field, tokens))}`)}
@@ -558,6 +584,37 @@ function StudioForm({
   )
 }
 
+/** Shown while the Studio holds an extension of an earlier video */
+function ExtendingNote({
+  original, mode, onCancel,
+}: {
+  original: MageGeneration | undefined
+  /** How the last frame is used: as the start frame, as @image1, or not yet */
+  mode: 'frame' | 'reference' | 'none'
+  onCancel: () => void
+}) {
+  return (
+    <div className="flex items-start gap-2 rounded-lg border border-[#6366f1]/40 bg-[#6366f1]/10 px-3 py-2">
+      <div className="min-w-0 flex-1 text-[11px] leading-relaxed text-[#c8c8d8]">
+        <p className="font-medium text-white">Extending a video</p>
+        <p className="text-[#8888aa] truncate" title={original?.prompt}>
+          {original ? `“${original.prompt.slice(0, 80)}${original.prompt.length > 80 ? '…' : ''}”` : 'An earlier generation'}
+        </p>
+        <p className="text-[#8888aa]">
+          {mode === 'frame'
+            ? 'Starts exactly from its last frame. Describe what happens next; when it’s done, use Join with original.'
+            : mode === 'reference'
+              ? 'Its last frame is @image1 (this model won’t take a start frame together with references), so it continues from it rather than starting on it exactly.'
+              : 'Add its last frame as a first frame or reference image to continue from it.'}
+        </p>
+      </div>
+      <button onClick={onCancel} className="text-[#55556a] hover:text-white flex-shrink-0" title="Not an extension">
+        <X size={12} />
+      </button>
+    </div>
+  )
+}
+
 // ── Run on the website (unlimited mode) ─────────────────────────────────────
 
 const MAGE_WEBSITE = 'https://www.mage.space'
@@ -570,8 +627,12 @@ const MAGE_WEBSITE = 'https://www.mage.space'
  * The result comes back through Import from Mage.
  */
 function RunOnWebsite({
-  prompt, modelLabel, settings, referencePaths, supportsReferences, frames,
+  architecture, runConfig, runInputs, prompt, modelLabel, settings, referencePaths, supportsReferences, frames,
 }: {
+  architecture: string
+  /** The Studio's request (settings, local inputs), remembered for the import */
+  runConfig: Record<string, unknown>
+  runInputs: Record<string, string | string[]>
   prompt: string
   modelLabel: string
   settings: string[]
@@ -622,6 +683,13 @@ function RunOnWebsite({
       const unmentioned = prep.handles.filter((_, i) => !new RegExp(`@image${i + 1}(?![a-z0-9_-])`, 'i').test(prompt))
       if (unmentioned.length) text = `${text}${/\s$/.test(text) ? '' : ' '}${unmentioned.map((h) => `@${h}`).join(' ')}`
       await copy(text)
+
+      // Remember what went to the website: when the result is imported, it
+      // gets these images and settings back (Mage doesn't return them)
+      const { prompt: _sent, ...settingsOnly } = runConfig
+      await invoke('mage_record_website_run', {
+        run: { prompt: text, architecture, config: settingsOnly, inputs: runInputs, handles: prep.handles },
+      }).catch(console.warn)
 
       const browser = useStore.getState().settings.mageWebsiteBrowser
       await invoke('open_url_in', { url: MAGE_WEBSITE, browser: browser || null }).catch(console.error)
@@ -859,7 +927,18 @@ function SelectedEntities({
             isSupported(e) ? 'border-[#2a2a3a] bg-[#16161f] text-[#e8e8f0]' : 'border-amber-500/40 bg-amber-500/5 text-amber-300'
           )}
         >
-          <span className="w-5 h-5 rounded-full overflow-hidden bg-[#2a2a3a] flex-shrink-0 flex items-center justify-center text-[#55556a]">
+          <span
+            onClick={() => {
+              const withImage = entities.filter((x) => x.local_image_path || x.image_url)
+              const i = withImage.findIndex((x) => x.id === e.id)
+              if (i >= 0) previewImages(withImage.map((x) => ({ path: (x.local_image_path ?? x.image_url)!, label: `${x.name} · @${x.handle}` })), i)
+            }}
+            className={cn(
+              'w-5 h-5 rounded-full overflow-hidden bg-[#2a2a3a] flex-shrink-0 flex items-center justify-center text-[#55556a]',
+              (e.local_image_path || e.image_url) && 'cursor-zoom-in'
+            )}
+            title={e.local_image_path || e.image_url ? 'Preview' : undefined}
+          >
             {e.local_image_path || e.image_url ? (
               <img src={e.local_image_path ? getThumbnailSrc(e.local_image_path) : e.image_url!} className="w-full h-full object-cover" alt="" />
             ) : e.kind === 'audio' ? <Music size={10} /> : e.entity_type === 'character' ? <User size={10} /> : <Shapes size={10} />}
@@ -979,7 +1058,7 @@ function DropZone({
 
 /** An image in a slot: drag it to another slot, or use the move buttons on hover. */
 function Thumb({
-  path, slot, badge, moves = [], onMove, onClear,
+  path, slot, badge, moves = [], onMove, onClear, onPreview,
 }: {
   path: string
   slot: Slot
@@ -988,6 +1067,8 @@ function Thumb({
   moves?: Slot[]
   onMove?: (to: Slot) => void
   onClear: () => void
+  /** Click: full-size preview */
+  onPreview?: () => void
 }) {
   return (
     <div
@@ -996,15 +1077,16 @@ function Thumb({
         e.dataTransfer.setData(SLOT_MIME, JSON.stringify({ path, from: slot }))
         e.dataTransfer.effectAllowed = 'move'
       }}
-      className="group relative aspect-square rounded-md overflow-hidden bg-[#16161f] border border-[#2a2a3a] cursor-grab active:cursor-grabbing"
-      title={`${path}\nDrag to another slot to move it`}
+      onClick={onPreview}
+      className="group relative aspect-square rounded-md overflow-hidden bg-[#16161f] border border-[#2a2a3a] cursor-zoom-in active:cursor-grabbing"
+      title={`${path}\nClick to preview · drag to another slot to move it`}
     >
       <img src={getThumbnailSrc(path)} className="w-full h-full object-cover pointer-events-none" alt="" />
       {badge && (
         <span className="absolute top-0.5 left-0.5 px-1 rounded bg-black/70 text-[9px] text-white group-hover:hidden">{badge}</span>
       )}
       <button
-        onClick={onClear}
+        onClick={(e) => { e.stopPropagation(); onClear() }}
         className="absolute top-0.5 right-0.5 hidden group-hover:flex w-4 h-4 rounded-full bg-black/70 text-white items-center justify-center"
         title="Remove"
       >
@@ -1015,7 +1097,7 @@ function Thumb({
           {moves.map((to) => (
             <button
               key={to}
-              onClick={() => onMove(to)}
+              onClick={(e) => { e.stopPropagation(); onMove(to) }}
               className="flex-1 min-w-0 px-0.5 py-0.5 rounded bg-black/75 hover:bg-[#6366f1] text-[9px] leading-none text-white truncate"
               title={to === 'ref' ? 'Move to the reference images' : `Move to the ${to} frame`}
             >
@@ -1029,7 +1111,7 @@ function Thumb({
 }
 
 function ImageSlot({
-  slot, path, targets, onPick, onPlace, onClear,
+  slot, path, targets, onPick, onPlace, onClear, onPreview,
 }: {
   slot: Slot
   path: string | null
@@ -1038,6 +1120,7 @@ function ImageSlot({
   onPick: () => void
   onPlace: (path: string, from: Slot | null, to: Slot) => void
   onClear: () => void
+  onPreview?: () => void
 }) {
   return (
     <DropZone onDrop={(p, from) => onPlace(p, from, slot)}>
@@ -1050,6 +1133,7 @@ function ImageSlot({
               moves={targets.filter((t) => t !== slot)}
               onMove={(to) => onPlace(path, slot, to)}
               onClear={onClear}
+              onPreview={onPreview}
             />
           </div>
         </div>

@@ -189,6 +189,43 @@ pub fn extract_thumbnail(video_path: &str, thumb_path: &str, time_secs: f64) -> 
     Ok(())
 }
 
+/// The frame shown at `time_secs`, as a full-size PNG.
+pub fn extract_frame(video_path: &str, time_secs: f64, out_path: &str) -> Result<()> {
+    let mut cmd = Command::new(ffmpeg_bin());
+    // -ss before -i seeks fast, then decodes to the exact frame
+    cmd.args([
+        "-y", "-ss", &format!("{:.3}", time_secs.max(0.0)),
+        "-i", video_path,
+        "-frames:v", "1",
+        "-q:v", "1",
+        out_path,
+    ]);
+    let out = run_with_timeout(cmd, Duration::from_secs(60))?;
+    if !out.status.success() || !Path::new(out_path).exists() {
+        return Err(anyhow!("Could not read the frame at {:.2}s of {}", time_secs, video_path));
+    }
+    Ok(())
+}
+
+/// The video's last frame as a full-size PNG (for continuing it: "extend").
+pub fn extract_last_frame(video_path: &str, out_path: &str) -> Result<()> {
+    let mut cmd = Command::new(ffmpeg_bin());
+    // Seek to just before the end and keep overwriting one image, so the
+    // file holds the very last decoded frame
+    cmd.args([
+        "-y", "-sseof", "-0.5",
+        "-i", video_path,
+        "-update", "1",
+        "-q:v", "1",
+        out_path,
+    ]);
+    let out = run_with_timeout(cmd, Duration::from_secs(60))?;
+    if !out.status.success() || !Path::new(out_path).exists() {
+        return Err(anyhow!("Could not read the last frame of {}", video_path));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrimSegment {
     pub start: f64,
