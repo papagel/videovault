@@ -4,7 +4,7 @@ import { X } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '@/store'
 import { VideoCard } from './VideoCard'
-import { VIDEOS_MIME, hasTags, inFolders, sortVideos } from '@/lib/library'
+import { VIDEOS_MIME, hasTags, inFolders, matchesSearch, searchWords, sortVideos } from '@/lib/library'
 import { VideoListRow } from './VideoListRow'
 import type { VideoFile } from '@/types'
 
@@ -47,6 +47,7 @@ export function VideoGrid() {
     view,
     gridSize,
     activeFolders,
+    watchedFolders,
     letterFilter,
     activeTags,
     tagFilterMode,
@@ -68,6 +69,7 @@ export function VideoGrid() {
       view: s.view,
       gridSize: s.gridSize,
       activeFolders: s.activeFolders,
+      watchedFolders: s.watchedFolders,
       letterFilter: s.letterFilter,
       activeTags: s.activeTags,
       tagFilterMode: s.tagFilterMode,
@@ -140,8 +142,9 @@ export function VideoGrid() {
     }
 
     if (searchQuery) {
-      const q = searchQuery.toLowerCase()
-      source = source.filter((v) => v.filename.toLowerCase().includes(q))
+      // File name, folder path and tags
+      const words = searchWords(searchQuery)
+      source = source.filter((v) => matchesSearch(v, words, watchedFolders))
     }
 
     // Collection view keeps the manual (position) order from the DB so
@@ -149,7 +152,7 @@ export function VideoGrid() {
     if (activeCollection) return [...source]
 
     return sortVideos(source, sortField, sortDir)
-  }, [videos, collectionVideos, activeFolders, letterFilter, activeTags, tagFilterMode, searchQuery, sortField, sortDir, activeCollection, pendingDeleteIds])
+  }, [videos, collectionVideos, watchedFolders, activeFolders, letterFilter, activeTags, tagFilterMode, searchQuery, sortField, sortDir, activeCollection, pendingDeleteIds])
 
   // Filter changes commit instantly (sidebar highlight); the card window
   // re-renders at background priority.

@@ -64,6 +64,7 @@ export const VideoCard = memo(function VideoCard({ video, size, queue, onContext
       <div className={cn('relative overflow-hidden bg-[#0d0d14] flex-shrink-0', thumbHeights[size])}>
         {thumbnailSrc ? (
           <img
+            draggable={false}
             src={thumbnailSrc}
             alt={video.filename}
             className="w-full h-full object-cover"

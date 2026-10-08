@@ -56,7 +56,7 @@ export const VideoListRow = memo(function VideoListRow({ video, queue, onContext
       {/* Thumbnail */}
       <div className="w-14 h-9 rounded overflow-hidden bg-[#0d0d14] flex-shrink-0 relative">
         {thumbnailSrc ? (
-          <img src={thumbnailSrc} alt="" className="w-full h-full object-cover" loading="lazy" />
+          <img src={thumbnailSrc} alt="" draggable={false} className="w-full h-full object-cover" loading="lazy" />
         ) : (
           <div className="w-full h-full flex items-center justify-center">
             <Play size={12} className="text-[#3a3a5a]" />

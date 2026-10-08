@@ -85,3 +85,21 @@ export async function newFolderIn(parent: string, ask: (title: string) => Promis
     return null
   }
 }
+
+/** Lowercase without accents, so "é" matches "e" and "ά" matches "α". */
+export const foldText = (s: string) => s.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase()
+
+/** Search words: every one must match (accents and case ignored). */
+export const searchWords = (query: string) => foldText(query).split(/\s+/).filter(Boolean)
+
+/**
+ * Whether a video matches every search word, each in its file name, its
+ * folder path below the library folder, or one of its tags (@characters too).
+ */
+export function matchesSearch(v: VideoFile, words: string[], roots: string[]): boolean {
+  if (words.length === 0) return true
+  const root = roots.find((r) => v.folder === r || v.folder.startsWith(r + '/'))
+  const where = root ? `${root.split('/').pop()}/${v.folder.slice(root.length)}` : v.folder
+  const text = foldText(`${v.filename} ${where} ${v.tags.map((t) => t.name).join(' ')}`)
+  return words.every((w) => text.includes(w))
+}

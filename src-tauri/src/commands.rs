@@ -2245,8 +2245,20 @@ fn move_video_file(conn: &Connection, id: &str, dest: &Path) -> Result<Option<(M
     // Clear a stale soft-deleted row that holds the target path
     let _ = conn.execute("DELETE FROM videos WHERE path = ?1 AND is_deleted = 1", params![new]);
     update(&new, &filename, &dest_folder).map_err(|e| format!("{}: {}", old_name, e))?;
-    // Same disk: a rename. Another disk: copy, then remove the original.
-    let result = std::fs::rename(&old, &new).or_else(|_| std::fs::copy(&old, &new).and_then(|_| std::fs::remove_file(&old)));
+    // A move is a rename. Only across disks (EXDEV) is it a copy, checked,
+    // then the original removed; any other failure stops, nothing is copied.
+    const EXDEV: i32 = 18;
+    let result = match std::fs::rename(&old, &new) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(EXDEV) => std::fs::copy(&old, &new).and_then(|copied| {
+            let original = std::fs::metadata(&old)?.len();
+            if copied != original {
+                return Err(std::io::Error::other(format!("copied {} of {} bytes", copied, original)));
+            }
+            std::fs::remove_file(&old)
+        }),
+        Err(e) => Err(e),
+    };
     if let Err(e) = result {
         // The original is still there: drop any partial copy, put the row back
         if Path::new(&old).exists() {
@@ -2255,6 +2267,7 @@ fn move_video_file(conn: &Connection, id: &str, dest: &Path) -> Result<Option<(M
         let _ = update(&old, &old_name, &old_folder);
         return Err(format!("{}: {}", old_name, e));
     }
+    log::info!("Moved {} -> {}", old, new);
     let mage = crate::mage_commands::sync_renamed_file(conn, &old, &new);
     Ok(Some((MovedVideo { video_id: id.to_string(), path: new, filename, folder: dest_folder }, mage)))
 }

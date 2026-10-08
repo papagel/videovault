@@ -2,7 +2,7 @@ import { useState, useRef, useMemo, useCallback, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { showConfirm, showPrompt } from '@/lib/dialog'
-import { VIDEOS_MIME, moveVideosTo, newFolderIn, refreshEmptyFolders } from '@/lib/library'
+import { VIDEOS_MIME, foldText, moveVideosTo, newFolderIn, refreshEmptyFolders, searchWords } from '@/lib/library'
 import {
   FolderOpen, ListVideo, Plus, ChevronRight, ChevronDown,
   Folder, Settings, Film, X, Search, RefreshCw, FolderPlus,
@@ -206,6 +206,23 @@ export function Sidebar() {
 
   const isFiltering = !!(activeFolders.length || activeCollection || activeTags.length || searchQuery)
 
+  // Folders and tags whose names match the search (shown above All Videos)
+  const searchMatches = useMemo(() => {
+    const words = searchWords(searchQuery)
+    if (words.length === 0) return { folders: [] as string[], tags: [] as [string, number][] }
+    const matches = (name: string) => {
+      const n = foldText(name)
+      return words.every((w) => n.includes(w))
+    }
+    const folders = [...rootFolders, ...rootFolders.flatMap((r) => subfoldersByRoot[r] ?? [])]
+      .filter((f) => matches(f.split('/').pop() ?? ''))
+      .slice(0, 6)
+    const counts = new Map<string, number>()
+    for (const v of videos) for (const t of v.tags) counts.set(t.name, (counts.get(t.name) ?? 0) + 1)
+    const tagMatches = [...counts.entries()].filter(([name]) => matches(name)).sort((a, b) => b[1] - a[1]).slice(0, 6)
+    return { folders, tags: tagMatches }
+  }, [searchQuery, rootFolders, subfoldersByRoot, videos])
+
   // Empty folders show too (e.g. a new one), reloaded when the folders change
   useEffect(() => { refreshEmptyFolders() }, [watchedFolders])
 
@@ -291,7 +308,7 @@ export function Sidebar() {
           <Search size={12} className="text-[#55556a] flex-shrink-0" />
           <input
             type="text"
-            placeholder="Search…"
+            placeholder="Search names, folders, tags…"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="bg-transparent text-xs text-[#e8e8f0] placeholder-[#55556a] outline-none flex-1 min-w-0"
@@ -305,6 +322,40 @@ export function Sidebar() {
       </div>
 
       <div className="flex-1 overflow-y-auto pb-2">
+
+        {/* Folders and tags whose names match the search */}
+        {(searchMatches.folders.length > 0 || searchMatches.tags.length > 0) && (
+          <div className="pb-1">
+            <p className="px-3 pt-1 pb-1 text-[10px] font-semibold uppercase tracking-widest text-[#55556a]">Matches</p>
+            {searchMatches.folders.map((f) => (
+              <button
+                key={f}
+                onClick={() => { setSearchQuery(''); setActiveTags([]); setActiveFolder(f) }}
+                title={f}
+                className="w-full flex items-center gap-2 px-3 py-1 text-xs text-[#8888aa] hover:text-white hover:bg-[#1e1e2a]"
+              >
+                <Folder size={11} className="flex-shrink-0 text-[#6366f1]" />
+                <span className="truncate flex-1 text-left">{f.split('/').pop()}</span>
+                <span className="text-[10px] text-[#3a3a5a] tabular-nums">{videoCount(f)}</span>
+              </button>
+            ))}
+            {searchMatches.tags.map(([name, count]) => (
+              <button
+                key={name}
+                onClick={() => { setSearchQuery(''); setActiveFolder(null); setActiveTags([name]) }}
+                className="w-full flex items-center gap-2 px-3 py-1 text-xs text-[#8888aa] hover:text-white hover:bg-[#1e1e2a]"
+              >
+                <span
+                  className="w-2 h-2 rounded-full flex-shrink-0"
+                  style={{ backgroundColor: tags.find((t) => t.name === name)?.color ?? '#6366f1' }}
+                />
+                <span className="truncate flex-1 text-left">{name}</span>
+                <span className="text-[10px] text-[#3a3a5a] tabular-nums">{count}</span>
+              </button>
+            ))}
+            <div className="h-px bg-[#1e1e2a] mx-3 mt-1" />
+          </div>
+        )}
 
         {/* All Videos */}
         <button
